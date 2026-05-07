@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+pandas
+openpyxl
+sqlalchemy
+pydantic
+pymysql
+cryptography
+apscheduler
+lark_oapi
+xlrd
