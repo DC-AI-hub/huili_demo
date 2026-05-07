@@ -1,0 +1,21 @@
+{
+  "period_patterns": [
+    "^YTD",
+    "^[0-9]+m",
+    "^[0-9]+y",
+    ".*\\(inception\\)$"
+  ],
+  "metric_patterns": {
+    "return_cum": "Return \\(Cumulative\\)",
+    "return_ann": "Return \\(Annualized\\)"
+  },
+  "peer_patterns": {
+    "peer_group_rank": "Peer group rank",
+    "peer_group_quartile": "Peer group quartile"
+  },
+  "size_patterns": {
+    "daily": "Fund Size - comprehensive \\(Daily\\)",
+    "monthly": "Fund Size - comprehensive \\(Monthly\\)"
+  },
+  "date_pattern": "(\\d{1,2}/\\d{1,2}/\\d{4})"
+}
