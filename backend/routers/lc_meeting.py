@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from typing import Optional
+from decimal import Decimal, ROUND_HALF_UP
 from database import SessionLocal
 from utils.date_resolver import resolve_as_of_date
 from models import (
@@ -14,12 +15,12 @@ router = APIRouter()
 
 
 def _fmt_pct(v) -> Optional[str]:
-    """将小数转换为带符号的百分比字符串，None 返回 None（前端自行显示 '-'）"""
+    """将小数转换为带符号的百分比字符串，使用 Decimal 实现精确四舍五入"""
     if v is None:
         return None
-    val = float(v) * 100
+    val = (Decimal(str(v)) * 100).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)
     sign = "+" if val >= 0 else ""
-    return f"{sign}{val:.1f}%"
+    return f"{sign}{val}%"
 
 
 def _to_float(v) -> Optional[float]:
@@ -30,14 +31,31 @@ def _pct_display(v) -> Optional[str]:
     """将 0.2762 格式化为 27.62%"""
     if v is None:
         return None
-    return f"{float(v) * 100:.2f}%"
+    val = (Decimal(str(v)) * 100).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return f"{val}%"
 
 
 def _pct_display_int(v) -> Optional[str]:
     """将 0.2790 格式化为 28% (取整)"""
     if v is None:
         return None
-    return f"{round(float(v) * 100)}%"
+    val = (Decimal(str(v)) * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+    return f"{val}%"
+
+
+def _fmt_aum(v) -> Optional[int]:
+    """AUM 四舍五入取整"""
+    if v is None:
+        return None
+    return int(Decimal(str(v)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
+
+def _fmt_vp_pct(v) -> Optional[str]:
+    """将小数格式化为百分比字符串，如 0.2762 → '27.6%'"""
+    if v is None:
+        return None
+    val = (Decimal(str(v)) * 100).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)
+    return f"{val}%"
 
 
 @router.get("/lc-meeting/fund-performance", summary="获取 LC Meeting 基金业绩数据")
@@ -73,8 +91,8 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
                 "fund_code":     r.fund_code,
                 "fund_name":     r.fund_name,
                 "benchmark":     r.benchmark,
-                "aum_usd_mn":    _to_float(r.aum_usd_mn),
-                "aum_vp_pct":    _to_float(r.aum_vp_pct),
+                "aum_usd_mn":    _fmt_aum(r.aum_usd_mn),
+                "aum_vp_pct":    _fmt_vp_pct(r.aum_vp_pct),
                 # YTD
                 "ytd_fund":      _fmt_pct(r.ytd_fund),
                 "ytd_bm":        _fmt_pct(r.ytd_bm),
@@ -110,8 +128,9 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
             })
 
         # ── 计算汇总行（不入库，API 层动态计算）──────────────────────
-        total_funds_aum = sum(r.get("aum_usd_mn") or 0 for r in result)
-        total_funds_vp_pct = sum(r.get("aum_vp_pct") or 0 for r in result)
+        # 从原始 DB 数据计算汇总，避免累积舍入误差
+        total_funds_aum = sum(Decimal(str(r.aum_usd_mn)) for r in rows if r.aum_usd_mn is not None)
+        total_funds_vp_pct = sum(Decimal(str(r.aum_vp_pct)) for r in rows if r.aum_vp_pct is not None)
 
         # Total VP's AUM: 从 sales_flow 取 __TOTAL__ 行
         from sqlalchemy import text as sa_text
@@ -134,8 +153,8 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
             "fund_code":    "",
             "fund_name":    "Total Funds' AUM (USD, million)",
             "benchmark":    None,
-            "aum_usd_mn":   round(total_funds_aum, 2),
-            "aum_vp_pct":   round(total_funds_vp_pct, 6),
+            "aum_usd_mn":   int(total_funds_aum.quantize(Decimal('1'), rounding=ROUND_HALF_UP)),
+            "aum_vp_pct":   f"{(total_funds_vp_pct * 100).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%",
         })
 
         result.append({
@@ -144,7 +163,7 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
             "fund_code":    "",
             "fund_name":    "Total VP's AUM (USD, million)",
             "benchmark":    None,
-            "aum_usd_mn":   total_vp_aum,
+            "aum_usd_mn":   int(Decimal(str(total_vp_aum)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)) if total_vp_aum is not None else None,
             "aum_vp_pct":   None,
         })
 

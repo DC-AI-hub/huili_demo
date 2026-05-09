@@ -178,15 +178,18 @@ SELECT
     f.ret_10y_ann/ :div,  bm.ret_10y_ann/ :div, (f.ret_10y_ann- bm.ret_10y_ann)/ :div,
     f.ret_20y_ann/ :div,  bm.ret_20y_ann/ :div, (f.ret_20y_ann- bm.ret_20y_ann)/ :div,
     -- Since Inception: 用 fund_code 精确匹配 inception period (如 "VPHY (inception)")
+    -- ⚠ 仅从 RF_fund performance_t-1 sheet 读取，避免多 sheet 数据污染
     (SELECT p.value FROM lc_report_qw_performance p
      JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
      WHERE p.report_id = :rid AND e.entity_type = 'fund'
+       AND e.sheet_name = 'RF_fund performance_t-1'
        AND e.entity_name = b.entity_name
        AND p.period_type = CONCAT(b.fund_code, ' (inception)')
        AND p.metric = 'return_ann' LIMIT 1) / :div,
     (SELECT p.value FROM lc_report_qw_performance p
      JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
      WHERE p.report_id = :rid AND e.entity_type = 'benchmark'
+       AND e.sheet_name = 'RF_fund performance_t-1'
        AND e.entity_name = b.bm_entity_name
        AND p.period_type = CONCAT(b.fund_code, ' (inception)')
        AND p.metric = 'return_ann' LIMIT 1) / :div,
@@ -194,6 +197,7 @@ SELECT
         (SELECT p.value FROM lc_report_qw_performance p
          JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
          WHERE p.report_id = :rid AND e.entity_type = 'fund'
+           AND e.sheet_name = 'RF_fund performance_t-1'
            AND e.entity_name = b.entity_name
            AND p.period_type = CONCAT(b.fund_code, ' (inception)')
            AND p.metric = 'return_ann' LIMIT 1), 0)
@@ -201,6 +205,7 @@ SELECT
         (SELECT p.value FROM lc_report_qw_performance p
          JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
          WHERE p.report_id = :rid AND e.entity_type = 'benchmark'
+           AND e.sheet_name = 'RF_fund performance_t-1'
            AND e.entity_name = b.bm_entity_name
            AND p.period_type = CONCAT(b.fund_code, ' (inception)')
            AND p.metric = 'return_ann' LIMIT 1), 0)

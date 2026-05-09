@@ -560,6 +560,12 @@ def load_to_mysql(
         # 检测实体类型并清洗名称
         raw_entity_name = str(row_data.get(first_col, "")).strip()
         entity_type = _detect_entity_type(raw_entity_name)
+        # ⚠ 补充规则：RF_fund performance_t-1 中 benchmark 实体的首列是普通指数名，
+        # 不以 "Benchmark" 开头，但其 group_category（分组标题）为 "BM"。
+        # _detect_entity_type 无法识别，需在此处补充覆盖。
+        group_cat = str(row_data.get("group_category", "")).strip()
+        if entity_type == "fund" and group_cat == "BM":
+            entity_type = "benchmark"
         is_benchmark = (entity_type == "benchmark")
         entity_name = _normalize_bm_entity_name(raw_entity_name) if is_benchmark else raw_entity_name
         entity_isin = "" if entity_type != "fund" else row_data.get("ISIN")

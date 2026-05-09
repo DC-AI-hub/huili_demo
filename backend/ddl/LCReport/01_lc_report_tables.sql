@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS lc_report (
     report_date     DATE            NOT NULL COMMENT '报告日期（如 2026-04-24）',
     status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING'
                     COMMENT '报告状态：PENDING-待完成 / DONE-已完成 / ARCHIVED-已归档（只读）/ DELETED-已删除',
+    analyst_note    LONGTEXT        NULL     COMMENT '分析师纪要（富文本）',
     archived_at     DATETIME        NULL     COMMENT '归档时间（由定时任务写入）',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP

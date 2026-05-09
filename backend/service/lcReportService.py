@@ -154,9 +154,11 @@ def get_report_list(
             }
         rtype = row[4]
         data_status = row[5]
+        original_name = row[6]
         if rtype and rtype in report_map[rid]["items"]:
             report_map[rid]["items"][rtype] = {
                 "file_id":           str(row[3]) if row[3] is not None else None,
+                "original_name":     original_name,
                 "hasData":           data_status in ("PARSING", "UNCHECKED", "CHECKED"),
                 "isChecked":         data_status == "CHECKED",
                 "data_status":       data_status,
@@ -256,18 +258,72 @@ def save_uploaded_file(
     if r and r[0] == "ARCHIVED":
         raise PermissionError(f"report_id={report_id} 已归档，不允许上传文件")
 
-    # 保存文件
-    date_dir = FILES_ROOT / report_date
-    date_dir.mkdir(parents=True, exist_ok=True)
-    stored_path = date_dir / filename
-    stored_path.write_bytes(file_bytes)
-    stored_rel = str(stored_path.relative_to(FILES_ROOT.parent))
-
     # 查是否已有同 (report_id, report_type) 的记录
     existing = db.execute(
         text("SELECT file_id FROM lc_report_file WHERE report_id=:rid AND report_type=:rt"),
         {"rid": report_id, "rt": report_type},
     ).fetchone()
+
+    # 保存文件（严格使用原始文件名，覆盖旧文件）
+    date_dir = FILES_ROOT / report_date
+    date_dir.mkdir(parents=True, exist_ok=True)
+    stored_path = date_dir / filename
+    
+    # 强制删除可能存在的旧同名物理文件（防止被进程锁定）
+    if stored_path.exists():
+        try:
+            stored_path.unlink()
+        except PermissionError:
+            raise ValueError(f"文件被占用无法覆盖，请检查后台是否有进程正在使用该文件: {filename}")
+        except Exception as e:
+            logger.warning(f"Failed to delete old file {stored_path}: {e}")
+            
+    stored_path.write_bytes(file_bytes)
+    stored_rel = str(stored_path.relative_to(FILES_ROOT.parent))
+
+    # 如果是 xls 文件，在同目录下生成同名的 xlsx 文件供前端核对使用
+    if filename.lower().endswith('.xls'):
+        xlsx_path = date_dir / (filename + 'x')
+        # LibreOffice 默认不覆盖文件，必须先删掉旧的 xlsx
+        if xlsx_path.exists():
+            try:
+                xlsx_path.unlink()
+            except PermissionError:
+                raise ValueError(f"生成的 xlsx 文件被占用无法覆盖，请检查后台进程: {filename}x")
+            except Exception:
+                pass
+                
+        try:
+            import platform
+            
+            if platform.system() == "Windows":
+                # 开发环境 (Windows)：调用用户指定的 LibreOffice 进行无损转换
+                import subprocess
+                soffice_path = r"D:\Program Files\LibreOffice\program\soffice.exe"
+                process = subprocess.run(
+                    [soffice_path, '--headless', '--nologo', '--nofirststartwizard', '--convert-to', 'xlsx', '--outdir', str(date_dir), str(stored_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                logger.info(f"Successfully converted {filename} to xlsx format via Windows LibreOffice.")
+            else:
+                # 生产环境 (Linux) 调用 LibreOffice 进行无损转换
+                import subprocess
+                process = subprocess.run(
+                    ['libreoffice', '--headless', '--nologo', '--nofirststartwizard', '--convert-to', 'xlsx', '--outdir', str(date_dir), str(stored_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                logger.info(f"Successfully converted {filename} to xlsx format via Linux LibreOffice.")
+                
+        except Exception as e:
+            logger.error(f"Failed to generate xlsx for {filename}: {e}")
+            try:
+                (FILES_ROOT / "win32com_error.txt").write_text(f"Error converting {filename}: {str(e)}", encoding='utf-8')
+            except Exception:
+                pass
 
     if existing:
         fid = existing[0]
@@ -297,6 +353,24 @@ def save_uploaded_file(
             },
         )
     db.commit()
+
+    # 清理历史残留的同类型 etl_ 目录（同一天只允许一个活跃的同类报告）
+    import shutil
+    try:
+        for p in date_dir.iterdir():
+            if p.is_dir():
+                if report_type == "Quartile_weekly":
+                    if p.name.startswith("etl_") and not p.name.startswith("etl_sales_") and not p.name.startswith("etl_fa_"):
+                        if p.name != f"etl_{fid}":
+                            shutil.rmtree(p, ignore_errors=True)
+                elif report_type == "SalesRptByProduct":
+                    if p.name.startswith("etl_sales_") and p.name != f"etl_sales_{fid}":
+                        shutil.rmtree(p, ignore_errors=True)
+                elif report_type == "FundAnalysis":
+                    if p.name.startswith("etl_fa_") and p.name != f"etl_fa_{fid}":
+                        shutil.rmtree(p, ignore_errors=True)
+    except Exception as e:
+        logger.warning(f"Failed to cleanup old etl dirs: {e}")
 
     if report_type == "Quartile_weekly":
         _trigger_parse_async(fid, report_id, report_type, stored_path)
@@ -610,6 +684,7 @@ def _trigger_fa_parse_async(
                 pass
         finally:
             db.close()
+
 
     threading.Thread(target=_run, daemon=True).start()
 

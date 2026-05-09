@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Luckysheet Frame</title>
+  <!-- Luckysheet 依赖 -->
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/css/pluginsCss.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/plugins.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/css/luckysheet.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/assets/iconfont/iconfont.css' />
+  <script src="https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/js/plugin.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/luckysheet.umd.js"></script>
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    #luckysheet-container { width: 100%; height: 100%; position: absolute; }
+  </style>
+</head>
+<body>
+  <div id="luckysheet-container"></div>
+  <script>
+    // 通知父窗口已准备就绪
+    window.parent.postMessage({ type: 'luckysheet-frame-ready' }, '*');
+
+    // 监听来自 Vue 父组件的消息
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (data && data.type === 'init-luckysheet') {
+        const payload = data.payload;
+        if (window.luckysheet) {
+          window.luckysheet.create({
+            container: 'luckysheet-container',
+            lang: 'zh',
+            showinfobar: false,
+            showtoolbar: false,
+            showstatisticBar: false,
+            sheetFormulaBar: false,
+            enableAddRow: false,
+            enableAddBackTop: false,
+            data: payload.sheets,
+            title: payload.title || '原始 Excel',
+            userInfo: payload.userInfo || ''
+          });
+        }
+      }
+    });
+  </script>
+</body>
+</html>

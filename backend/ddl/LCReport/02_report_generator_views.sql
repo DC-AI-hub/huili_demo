@@ -18,12 +18,13 @@ DROP VIEW IF EXISTS v_fund_period_returns;
 -- -------------------------------------------------------------
 -- View 1: v_fund_period_returns
 --   映射：lc_report_qw_performance × lc_report_qw_entity
---   Excel 对应：'AUM with monthly return' 的 Fund / BM 行
+--   Excel 对应：'RF_fund performance_t-1' Sheet 的 Fund / BM 收益行
 --   每行 = 一个 (as_of_date, report_id, entity_name, isin) × 宽列各周期收益
 --   metric_kind: 'fund' = ISIN 非空行，'bm' = ISIN 为空的 Benchmark 行
 --
---   ⚠ 重要修改：从 lc_report_qw_performance（Quartile_weekly）读取，
---     而非 lc_report_fa_performance（FundAnalysis），与 Excel 逻辑一致
+--   ⚠ 重要：各周期收益数据来源仅限 sheet_name='RF_fund performance_t-1'
+--     （Morningstar AUM sheet），不能混入 VP_PG_HKSFC / Offshore / UCITS 的数据
+--     否则同一基金若在多个 sheet 中存在，MAX() 聚合会取到错误来源的收益值
 -- -------------------------------------------------------------
 CREATE OR REPLACE VIEW v_fund_period_returns AS
 SELECT
@@ -55,6 +56,7 @@ FROM lc_report_qw_performance p
 JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
 JOIN lc_report r ON r.report_id = p.report_id
 WHERE e.entity_type IN ('fund', 'benchmark')
+  AND e.sheet_name = 'RF_fund performance_t-1'   -- ⚠ 仅取 Morningstar AUM sheet 的收益数据
 GROUP BY r.report_date, p.report_id, e.entity_name, e.isin, e.entity_type;
 
 
@@ -63,25 +65,51 @@ GROUP BY r.report_date, p.report_id, e.entity_name, e.isin, e.entity_type;
 --   映射：lc_report_qw_performance × lc_report_qw_entity
 --   Excel 对应：Summary HKSFC / Offshore / UCITS 的四分位列
 --   每行 = 一个 (as_of_date, entity_name, isin) × 宽列各周期四分位
+--   ⚠ 仅限 VP_PG 三个 sheet，RF_fund performance_t-1 不含四分位排名数据
 -- -------------------------------------------------------------
 CREATE OR REPLACE VIEW v_fund_quartiles AS
 SELECT
-    r.report_date                          AS as_of_date,
-    e.entity_name,
-    e.isin,
-    e.benchmark,
-    e.morningstar_rating,
-    MAX(CASE WHEN p.period_type IN ('YTD')                                        THEN p.peer_group_quartile END) AS q_ytd,
-    MAX(CASE WHEN p.period_type IN ('1y','1Y')                                    THEN p.peer_group_quartile END) AS q_1y,
-    MAX(CASE WHEN p.period_type IN ('3y','3Y')                                    THEN p.peer_group_quartile END) AS q_3y,
-    MAX(CASE WHEN p.period_type IN ('5y','5Y')                                    THEN p.peer_group_quartile END) AS q_5y,
-    MAX(CASE WHEN p.period_type IN ('10y','10Y')                                  THEN p.peer_group_quartile END) AS q_10y,
-    MAX(CASE WHEN p.period_type IN ('20y','20Y')                                  THEN p.peer_group_quartile END) AS q_20y,
-    MAX(CASE WHEN p.period_type IN ('Since Inception','SI','since_inception')     THEN p.peer_group_quartile END) AS q_si
-FROM lc_report_qw_performance p
-JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
-JOIN lc_report            r ON r.report_id = p.report_id
-GROUP BY r.report_date, e.entity_name, e.isin, e.benchmark, e.morningstar_rating;
+    as_of_date,
+    entity_name,
+    isin,
+    benchmark,
+    morningstar_rating,
+    MAX(CASE WHEN period_type IN ('YTD')                                        THEN peer_group_quartile END) AS q_ytd,
+    MAX(CASE WHEN period_type IN ('1y','1Y')                                    THEN peer_group_quartile END) AS q_1y,
+    MAX(CASE WHEN period_type IN ('3y','3Y')                                    THEN peer_group_quartile END) AS q_3y,
+    MAX(CASE WHEN period_type IN ('5y','5Y')                                    THEN peer_group_quartile END) AS q_5y,
+    MAX(CASE WHEN period_type IN ('10y','10Y')                                  THEN peer_group_quartile END) AS q_10y,
+    MAX(CASE WHEN period_type IN ('20y','20Y')                                  THEN peer_group_quartile END) AS q_20y,
+    MAX(CASE WHEN period_type IN ('Since Inception','SI','since_inception')     THEN peer_group_quartile END) AS q_si
+FROM (
+    -- 按 sheet 优先级去重：HKSFC > Offshore > UCITS
+    -- 同一基金在多个 sheet 中有不同四分位时，仅取最高优先级 sheet 的数据
+    SELECT
+        r.report_date                          AS as_of_date,
+        e.entity_name,
+        e.isin,
+        e.benchmark,
+        e.morningstar_rating,
+        p.period_type,
+        p.peer_group_quartile,
+        ROW_NUMBER() OVER (
+            PARTITION BY r.report_date, e.entity_name, p.period_type
+            ORDER BY FIELD(e.sheet_name,
+                'VP_PG_HKSFC funds_t-1_inc',
+                'VP_PG_Offshore funds_t-1_Inc',
+                'VP_PG_UCITS Funds_t-1_Inc')
+        ) AS rn
+    FROM lc_report_qw_performance p
+    JOIN lc_report_qw_entity e ON e.entity_id = p.entity_id
+    JOIN lc_report            r ON r.report_id = p.report_id
+    WHERE e.sheet_name IN (                          -- ⚠ 仅取 VP_PG 三个 sheet 的四分位数据
+        'VP_PG_HKSFC funds_t-1_inc',
+        'VP_PG_Offshore funds_t-1_Inc',
+        'VP_PG_UCITS Funds_t-1_Inc'
+    )
+) ranked
+WHERE rn = 1
+GROUP BY as_of_date, entity_name, isin, benchmark, morningstar_rating;
 
 
 -- -------------------------------------------------------------
@@ -107,7 +135,21 @@ SELECT
         WHEN perf.aum_usd_mn > 15 AND perf.aum_usd_mn <= 100 THEN 'USD 15mil - 100mil' COLLATE utf8mb4_general_ci
         ELSE '<= USD 15mil' COLLATE utf8mb4_general_ci
     END AS aum_category,
-    qr.q_ytd, qr.q_1y, qr.q_3y, qr.q_5y, qr.q_10y, qr.q_20y, qr.q_si,
+    qr.q_ytd, qr.q_1y, qr.q_3y, qr.q_5y, qr.q_10y, qr.q_20y,
+    -- q_si: period_type 格式为 '{fund_code} (inception)'，需用 fund_code 精确匹配
+    -- 按 sheet 优先级：HKSFC > Offshore > UCITS
+    (SELECT p2.peer_group_quartile
+     FROM lc_report_qw_performance p2
+     JOIN lc_report_qw_entity e2 ON e2.entity_id = p2.entity_id
+     JOIN lc_report r2 ON r2.report_id = p2.report_id
+     WHERE r2.report_date = perf.report_date
+       AND e2.entity_name = COALESCE(fcm.entity_name, perf.fund_name) COLLATE utf8mb4_general_ci
+       AND e2.sheet_name IN ('VP_PG_HKSFC funds_t-1_inc','VP_PG_Offshore funds_t-1_Inc','VP_PG_UCITS Funds_t-1_Inc')
+       AND p2.period_type = CONCAT(perf.fund_code, ' (inception)') COLLATE utf8mb4_general_ci
+       AND p2.peer_group_quartile IS NOT NULL
+     ORDER BY FIELD(e2.sheet_name,'VP_PG_HKSFC funds_t-1_inc','VP_PG_Offshore funds_t-1_Inc','VP_PG_UCITS Funds_t-1_Inc')
+     LIMIT 1
+    ) AS q_si,
     CASE WHEN perf.ytd_fund       IS NULL THEN 'N/A' COLLATE utf8mb4_general_ci
          WHEN perf.ytd_bm         IS NULL THEN 'No BMK' COLLATE utf8mb4_general_ci
          WHEN perf.ytd_excess      > 0    THEN 'A' COLLATE utf8mb4_general_ci ELSE 'B' COLLATE utf8mb4_general_ci END AS vs_bmk_ytd,
