@@ -233,6 +233,32 @@ def delete_report(db: Session, report_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 手动归档报告
+# ---------------------------------------------------------------------------
+
+def archive_report(db: Session, report_id: int) -> bool:
+    """手动将报告状态更新为 ARCHIVED。仅允许对已生成（DONE）的报告操作。"""
+    row = db.execute(
+        text("SELECT status FROM lc_report WHERE report_id=:rid"),
+        {"rid": report_id},
+    ).fetchone()
+
+    if not row:
+        raise ValueError(f"报告 ID={report_id} 不存在")
+    if row[0] == "ARCHIVED":
+        raise ValueError(f"报告 ID={report_id} 已归档")
+    if row[0] != "DONE":
+        raise PermissionError(f"报告尚未生成，不可归档（当前状态：{row[0]}）")
+
+    db.execute(
+        text("UPDATE lc_report SET status='ARCHIVED', archived_at=NOW(), updated_at=NOW() WHERE report_id=:rid"),
+        {"rid": report_id},
+    )
+    db.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 上传文件 + 触发解析
 # ---------------------------------------------------------------------------
 

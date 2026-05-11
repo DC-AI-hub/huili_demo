@@ -8,7 +8,7 @@
         <h2 class="compare-title">双屏对比：{{ itemKey }}</h2>
       </div>
       <div class="ch-right">
-        <button class="btn-success btn-pass" @click="handleVerify" :disabled="verifying">
+        <button v-if="!readonly" class="btn-success btn-pass" @click="handleVerify" :disabled="verifying">
           <span class="material-symbols-outlined">check_circle</span>
           {{ verifying ? '提交中...' : '通过' }}
         </button>
@@ -62,7 +62,11 @@
         <div class="sheet-header modified">
           <span class="material-symbols-outlined sheet-icon" style="color: #059669;">table_view</span>
           最新修订版 (Modified) - 系统导入后数据
-          <span class="badge badge-warning" style="margin-left: auto;">待核对</span>
+          <span
+            class="badge"
+            :class="isCheckedOrVerified ? 'badge-success' : 'badge-warning'"
+            style="margin-left: auto;"
+          >{{ isCheckedOrVerified ? '已核对' : '待核对' }}</span>
         </div>
         <div class="sheet-body">
           <!-- FundAnalysis: 网页渲染组件 -->
@@ -88,15 +92,22 @@ import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import LCFundAnalysisView from './LCFundAnalysisView.vue'
 
 const props = defineProps({
-  report: { type: Object, required: true },
-  itemKey: { type: String, required: true },
+  report:   { type: Object,  required: true },
+  itemKey:  { type: String,  required: true },
+  readonly: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['close', 'verified'])
 
 const BASE = '/api/lc-report'
-const verifying = ref(false)
+const verifying  = ref(false)
 const verifyError = ref('')
+const isVerified  = ref(false)   // 本次会话内通过核对
+
+// 已核对：本次通过 or 文件本身已是 CHECKED 状态
+const isCheckedOrVerified = computed(() =>
+  isVerified.value || (props.report?.items?.[props.itemKey]?.isChecked ?? false)
+)
 
 // ── FundAnalysis 专用状态 ───────────────────────────────
 const faSheets = ref([])
@@ -131,8 +142,10 @@ async function handleVerify() {
   try {
     const res = await fetch(`${BASE}/files/${fileId}/check`, { method: 'POST' })
     const json = await res.json()
-    if (json.success) emit('verified')
-    else verifyError.value = json.detail || '核对失败'
+    if (json.success) {
+      isVerified.value = true
+      emit('verified')
+    } else verifyError.value = json.detail || '核对失败'
   } catch (e) {
     verifyError.value = '网络错误：' + e.message
   } finally {
@@ -691,4 +704,5 @@ async function initRightPanel() {
   letter-spacing: 0.02em;
 }
 .badge-warning { background: #fef3c7; color: #b45309; }
+.badge-success { background: #d1fae5; color: #065f46; }
 </style>

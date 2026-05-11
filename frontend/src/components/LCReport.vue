@@ -87,14 +87,23 @@
                     {{ report.status_label }}
                   </span>
                 </div>
-                <button
-                  v-if="!report.is_readonly"
-                  class="btn-delete-report"
-                  @click="handleDeleteReport(report)"
-                  title="删除报告"
-                >
-                  <span class="material-symbols-outlined">delete</span>
-                </button>
+                <div class="header-actions" v-if="!report.is_readonly">
+                  <button
+                    class="btn-archive-report"
+                    :disabled="report.status !== 'DONE'"
+                    @click="handleArchiveReport(report)"
+                    title="归档报告"
+                  >
+                    <span class="material-symbols-outlined">archive</span>
+                  </button>
+                  <button
+                    class="btn-delete-report"
+                    @click="handleDeleteReport(report)"
+                    title="删除报告"
+                  >
+                    <span class="material-symbols-outlined">delete</span>
+                  </button>
+                </div>
               </div>
               <div v-if="report.is_readonly" class="archived-tip">
                 该报告已于周五 18:00 后自动归档，仅可查看。
@@ -122,7 +131,7 @@
                     >上传</button>
                     <button
                       class="btn-sm btn-verify"
-                      :disabled="report.is_readonly || !report.items.Quartile_weekly.hasData || report.items.Quartile_weekly.data_status === 'PARSING'"
+                      :disabled="!report.items.Quartile_weekly.hasData || report.items.Quartile_weekly.data_status === 'PARSING'"
                       @click="openVerifyModal(report, 'Quartile_weekly')"
                     >
                       核对
@@ -150,7 +159,7 @@
                     >上传</button>
                     <button
                       class="btn-sm btn-verify"
-                      :disabled="report.is_readonly || !report.items.SalesRptByProduct.hasData || report.items.SalesRptByProduct.data_status === 'PARSING'"
+                      :disabled="!report.items.SalesRptByProduct.hasData || report.items.SalesRptByProduct.data_status === 'PARSING'"
                       @click="openVerifyModal(report, 'SalesRptByProduct')"
                     >
                       核对
@@ -178,7 +187,7 @@
                     >上传</button>
                     <button
                       class="btn-sm btn-verify"
-                      :disabled="report.is_readonly || !report.items.FundAnalysis.hasData || report.items.FundAnalysis.data_status === 'PARSING'"
+                      :disabled="!report.items.FundAnalysis.hasData || report.items.FundAnalysis.data_status === 'PARSING'"
                       @click="openVerifyModal(report, 'FundAnalysis')"
                     >
                       核对
@@ -207,7 +216,7 @@
                   </button>
                   <button
                     class="btn-view"
-                    :disabled="!isReportReady(report)"
+                    :disabled="report.status !== 'DONE'"
                     @click="handleViewReport(report)"
                   >
                     查看报告
@@ -259,6 +268,7 @@
       v-if="showVerifyModal"
       :report="currentVerifyReport"
       :itemKey="currentVerifyItem"
+      :readonly="currentVerifyReport?.is_readonly ?? false"
       @close="closeVerifyModal"
       @verified="onVerified"
     />
@@ -428,6 +438,23 @@ async function handleDeleteReport(report) {
   }
 }
 
+async function handleArchiveReport(report) {
+  if (report.status !== 'DONE') return
+  if (!confirm(`确定要归档 ${report.reportTime} 的报告吗？归档后不可删除。`)) return
+  try {
+    const res = await fetch(`${BASE}/reports/${report.id}/archive`, { method: 'POST' })
+    const json = await res.json()
+    if (json.success) {
+      alert('报告已归档')
+      fetchReports()
+    } else {
+      alert('归档失败: ' + (json.message || json.detail))
+    }
+  } catch (e) {
+    alert('请求失败：' + e.message)
+  }
+}
+
 // ─── 上传文件 Modal ───────────────────────────────────────────
 const showUploadModal = ref(false)
 const currentUploadReport = ref(null)
@@ -480,7 +507,7 @@ async function confirmUpload() {
       }
 
       if (json.data?.file_id) {
-        startPolling(json.data.file_id, report, itemKey)
+        startPolling(json.data.file_id, report.id, itemKey)
       }
     } else {
       uploadError.value = json.detail || '上传失败'
@@ -493,7 +520,7 @@ async function confirmUpload() {
 }
 
 /** 每 3 秒轮询一次文件状态，直到状态脱离 PARSING (局部更新，避免全列表刷新) */
-function startPolling(fileId, report, itemKey) {
+function startPolling(fileId, reportId, itemKey) {
   if (pollingTimers.value[fileId]) return
   const timer = setInterval(async () => {
     try {
@@ -501,9 +528,10 @@ function startPolling(fileId, report, itemKey) {
       const json = await res.json()
       if (json.success) {
         const s = json.data.data_status
-        
-        // 局部更新绑定的 report item，不调用全量 fetchReports 避免页面抖动
-        const item = report.items[itemKey]
+
+        // 每次从 reports.value 里找最新的活跃引用，避免 fetchReports() 后引用失效
+        const liveReport = reports.value.find(r => r.id === reportId)
+        const item = liveReport?.items[itemKey]
         if (item) {
           item.data_status = s
           item.data_status_label = json.data.data_status_label
@@ -896,6 +924,36 @@ h1, h2, h3, h4, .font-headline {
   background: rgba(239, 68, 68, 0.1);
   transform: scale(1.05);
 }
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-archive-report {
+  background: transparent;
+  border: none;
+  color: #d97706;
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-archive-report:hover:not(:disabled) {
+  background: rgba(217, 119, 6, 0.1);
+  transform: scale(1.05);
+}
+
+.btn-archive-report:disabled {
+  color: #cbd5e1;
+  cursor: not-allowed;
+}
+
 
 .card-header h3 {
   margin: 0;

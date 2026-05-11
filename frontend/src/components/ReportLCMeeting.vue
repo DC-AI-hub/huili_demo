@@ -80,6 +80,10 @@ const showEditor    = ref(false)
 
 const isArchived    = computed(() => noteStatus.value === 'ARCHIVED')
 const hasNote       = computed(() => !!analystNote.value && analystNote.value !== '<p><br></p>')
+// 将原始 \n 转为 <br>，确保 HTML 渲染时保留忌行
+const renderedNote  = computed(() =>
+  (analystNote.value || '').replace(/\n/g, '<br>')
+)
 
 async function fetchNote(date) {
   if (!date) return
@@ -312,7 +316,7 @@ onMounted(fetchData)
           @click="openEditor"
         >
           <!-- 有内容：渲染富文本 -->
-          <div v-if="hasNote" class="analyst-note-content" v-html="analystNote"></div>
+          <div v-if="hasNote" class="analyst-note-content" v-html="renderedNote"></div>
           <!-- 无内容：占位符 -->
           <div v-else class="analyst-note-placeholder">
             <span class="placeholder-icon">✏️</span>
@@ -587,7 +591,7 @@ tfoot td {
   border-radius: 4px;
   background: #f5f7fa;
   margin: 4px 0 0;
-  padding: 10px 36px 10px 0px;
+  padding: 0px 0px 10px 0px;
   cursor: pointer;
   transition: border-color .2s, background .2s;
   font-family: 'Calibri', 'Arial', sans-serif;

@@ -23,6 +23,7 @@ from service.lcReportService import (
     get_report_list,
     create_report,
     delete_report,
+    archive_report,
     save_uploaded_file,
     get_file_status,
     check_file,
@@ -256,6 +257,26 @@ def api_delete_report(
         return {"success": True, "message": "删除成功"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/reports/{report_id}/archive", summary="手动归档报告")
+def api_archive_report(
+    report_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    手动将报告状态变更为 ARCHIVED（已归档）。
+    仅对已生成（DONE）的报告有效；归档后不可删除，只能查看。
+    """
+    try:
+        archive_report(db, report_id)
+        return {"success": True, "message": "归档成功"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
