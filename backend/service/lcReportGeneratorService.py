@@ -280,10 +280,10 @@ SELECT
     SUM(CASE WHEN q IN (1,2) THEN aum_usd_mn ELSE 0 END)
         / NULLIF(SUM(CASE WHEN q IN (1,2,3,4) THEN aum_usd_mn ELSE 0 END), 0) AS pct_of_aum
 FROM (
-    SELECT report_date, as_of_date, aum_usd_mn, 'YTD' AS period, q_ytd AS q FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '1Y',             q_1y         FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '3Y',             q_3y         FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '5Y',             q_5y         FROM v_working_sheet
+    SELECT report_date, as_of_date, aum_usd_mn, 'YTD' AS period, ms_rank_ytd AS q FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '1Y',             ms_rank_1y         FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '3Y',             ms_rank_3y         FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '5Y',             ms_rank_5y         FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund'
 ) x
 WHERE x.report_date = :d
 GROUP BY as_of_date, period
@@ -300,10 +300,10 @@ SELECT
     SUM(CASE WHEN tag = 'A' THEN aum_usd_mn ELSE 0 END)
         / NULLIF(SUM(CASE WHEN tag IN ('A','B') THEN aum_usd_mn ELSE 0 END), 0) AS pct_of_aum
 FROM (
-    SELECT report_date, as_of_date, aum_usd_mn, 'YTD' AS period, vs_bmk_ytd AS tag FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '1Y',             vs_bmk_1y        FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '3Y',             vs_bmk_3y        FROM v_working_sheet UNION ALL
-    SELECT report_date, as_of_date, aum_usd_mn, '5Y',             vs_bmk_5y        FROM v_working_sheet
+    SELECT report_date, as_of_date, aum_usd_mn, 'YTD' AS period, vs_bmk_ytd AS tag FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '1Y',             vs_bmk_1y        FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '3Y',             vs_bmk_3y        FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund' UNION ALL
+    SELECT report_date, as_of_date, aum_usd_mn, '5Y',             vs_bmk_5y        FROM lc_fund_performance_rating WHERE aum_usd_mn > 15 AND fund_name != 'VP Asian Dynamic Bond Fund'
 ) x
 WHERE x.report_date = :d
 GROUP BY as_of_date, period
