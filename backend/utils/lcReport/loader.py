@@ -495,7 +495,7 @@ def _upsert_performance(
 
 
 # ---------------------------------------------------------------------------
-# 主入口
+# 主入口（批量版 — 消除 N+1 查询，单事务保证原子性）
 # ---------------------------------------------------------------------------
 
 def load_to_mysql(
@@ -507,7 +507,12 @@ def load_to_mysql(
     inception_date_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, int]:
     """
-    阶段二主入口：将 pipeline 输出的 DataFrame 幂等写入 MySQL。
+    阶段二主入口：将 pipeline 输出的 DataFrame 幂等批量写入 MySQL。
+
+    优化：
+      - 所有 DELETE + INSERT 在同一个事务内执行
+      - 用 Python 侧收集数据 → executemany 批量写入，消除 N+1 SELECT 查询
+      - 若任意步骤失败，rollback 自动还原旧数据
 
     Args:
         db:                 SQLAlchemy Session
@@ -515,37 +520,45 @@ def load_to_mysql(
         meta_records:       run_pipeline 返回的 meta_records
         report_id:          对应的 lc_report.report_id
         report_type:        报告类型（如 Quartile_weekly）
-        inception_date_map: {fund_code: 'YYYY-MM-DD'}，来自 pipeline.extract_qw_inception_dates()
+        inception_date_map: {fund_code: 'YYYY-MM-DD'}
 
     Returns:
         统计字典 {report_meta_rows, entity_rows_processed, performance_rows_changed, fund_map_rows}
     """
+    import time
+    t0 = time.perf_counter()
+
     if parsed_df.empty:
         logger.warning("[loader] parsed_df is empty, nothing to load.")
         return {"report_meta_rows": 0, "entity_rows_processed": 0, "performance_rows_changed": 0}
 
-    # 开启事务：先清理该报告的旧数据，防止重复上传时有脏数据残留
-    db.execute(text("DELETE FROM lc_report_qw_performance WHERE report_id=:rid"), {"rid": report_id})
-    db.execute(text("DELETE FROM lc_report_qw_size_snapshot WHERE report_id=:rid"), {"rid": report_id})
-    db.execute(text("DELETE FROM lc_report_qw_entity WHERE report_id=:rid"), {"rid": report_id})
-    db.execute(text("DELETE FROM lc_report_qw_meta WHERE report_id=:rid"), {"rid": report_id})
-
     first_col = _first_column_name(parsed_df)
     mapped_columns = {c: map_column(c) for c in parsed_df.columns}
-
-    # --- 写入元数据，建立 (report_set, sheet_name) -> meta_id 映射 ---
-    meta_key_to_id: Dict[tuple, int] = {}
-    for record in meta_records:
-        mid = _upsert_report_meta(db, report_id, report_type, record)
-        meta_key_to_id[(record["report_set"], record["sheet_name"])] = mid
-
-    # --- 预建 sheet_name -> currency 映射 ---
     sheet_currency: Dict[str, str] = {
         r["sheet_name"]: r.get("currency", "") for r in meta_records
     }
 
-    inserted_entities = 0
-    inserted_perf = 0
+    # ------------------------------------------------------------------
+    # 第一步：在 Python 侧收集全部待写入数据（不发任何 SELECT）
+    # ------------------------------------------------------------------
+    meta_key_to_id: Dict[tuple, int] = {}
+    meta_batch: List[Dict] = []
+    for record in meta_records:
+        mid = gen_id()
+        meta_key_to_id[(record["report_set"], record["sheet_name"])] = mid
+        meta_batch.append({
+            "mid": mid, "rid": report_id, "rt": report_type,
+            "rs": record["report_set"], "sf": record["source_filename"],
+            "sn": record["sheet_name"], "rn": record.get("report_name"),
+            "cur": record.get("currency"), "gb": record.get("grouped_by"),
+            "co": _to_text(record.get("calculated_on")),
+            "eo": _to_text(record.get("exported_on")),
+            "eid_": record.get("etl_run_id"),
+        })
+
+    entity_batch: List[Dict] = []
+    size_batch:   List[Dict] = []
+    perf_batch:   List[Dict] = []
 
     for row_data in parsed_df.to_dict("records"):
         if not _is_data_row(row_data.get(first_col)):
@@ -557,54 +570,171 @@ def load_to_mysql(
             logger.warning(f"[loader] meta_id not found for key={key}, skipping row.")
             continue
 
-        # 检测实体类型并清洗名称
         raw_entity_name = str(row_data.get(first_col, "")).strip()
         entity_type = _detect_entity_type(raw_entity_name)
-        # ⚠ 补充规则：RF_fund performance_t-1 中 benchmark 实体的首列是普通指数名，
-        # 不以 "Benchmark" 开头，但其 group_category（分组标题）为 "BM"。
-        # _detect_entity_type 无法识别，需在此处补充覆盖。
         group_cat = str(row_data.get("group_category", "")).strip()
         if entity_type == "fund" and group_cat == "BM":
             entity_type = "benchmark"
         is_benchmark = (entity_type == "benchmark")
-        entity_name = _normalize_bm_entity_name(raw_entity_name) if is_benchmark else raw_entity_name
-        entity_isin = "" if entity_type != "fund" else row_data.get("ISIN")
+        entity_name  = _normalize_bm_entity_name(raw_entity_name) if is_benchmark else raw_entity_name
+        entity_isin  = "" if entity_type != "fund" else _to_text(row_data.get("ISIN"))
 
-        entity_payload = {
-            "report_set":           row_data["report_set"],
-            "sheet_name":           row_data["row_source_sheet"],
-            "entity_name":          entity_name,
-            "entity_type":          entity_type,
-            "isin":                 entity_isin,
-            "strategy_group":       row_data.get("group_category"),
-            "morningstar_rating":   row_data.get("Morningstar Rating Overall"),
-            "morningstar_category": row_data.get("Morningstar Category"),
-            "benchmark":            row_data.get("Calculation Benchmark"),
-            "currency":             sheet_currency.get(row_data["row_source_sheet"], ""),
-            "etl_run_id":           row_data.get("etl_run_id"),
-            "source_row_number":    int(row_data.get("row_number", 0)),
-        }
-        entity_id = _upsert_entity(db, report_id, report_type, entity_payload)
-        inserted_entities += 1
+        eid = gen_id()
+        entity_batch.append({
+            "eid": eid, "rid": report_id, "rt": report_type,
+            "rs": row_data["report_set"], "sn": row_data["row_source_sheet"],
+            "en": entity_name, "et": entity_type, "isin": entity_isin,
+            "sg": row_data.get("group_category"),
+            "mr": row_data.get("Morningstar Rating Overall"),
+            "mc": row_data.get("Morningstar Category"),
+            "bm": row_data.get("Calculation Benchmark"),
+            "cur": sheet_currency.get(row_data["row_source_sheet"], ""),
+            "srn": int(row_data.get("row_number", 0)),
+            "etl": row_data.get("etl_run_id"),
+        })
 
-        _upsert_size_snapshots(db, entity_id, report_id, report_type, row_data, mapped_columns)
-        inserted_perf += _upsert_performance(
-            db, meta_id, entity_id, report_id, report_type, row_data, mapped_columns
-        )
+        # 收集 size snapshot
+        for column_name, mapping in mapped_columns.items():
+            if mapping.size_type is None or mapping.end_date is None:
+                continue
+            snapshot_value = _to_float(row_data.get(column_name))
+            if snapshot_value is None:
+                continue
+            size_batch.append({
+                "sid": gen_id(), "eid": eid, "rid": report_id, "rt": report_type,
+                "st": mapping.size_type, "sd": mapping.end_date,
+                "sv": snapshot_value, "scn": column_name,
+            })
 
-    db.commit()
+        # 收集 performance（按 period_type 聚合，与原逻辑一致）
+        grouped: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        for column_name, mapping in mapped_columns.items():
+            if mapping.period_type is None:
+                continue
+            if mapping.value_role not in {"value", "peer_group_rank", "peer_group_quartile"}:
+                continue
+            pt = mapping.period_type
+            grouped[pt].setdefault("period_label",   mapping.period_label)
+            grouped[pt].setdefault("start_date",     mapping.start_date)
+            grouped[pt].setdefault("end_date",       mapping.end_date)
+            grouped[pt].setdefault("metrics",        {})
+            grouped[pt].setdefault("peer_group_rank",    None)
+            grouped[pt].setdefault("peer_group_quartile", None)
+
+            val = _to_float(row_data.get(column_name))
+            if mapping.value_role == "value":
+                grouped[pt]["metrics"][mapping.metric_kind] = (val, column_name)
+            elif mapping.value_role == "peer_group_rank":
+                grouped[pt]["peer_group_rank"] = val
+            elif mapping.value_role == "peer_group_quartile":
+                grouped[pt]["peer_group_quartile"] = val
+
+        for period_type, payload in grouped.items():
+            for metric, metric_info in payload["metrics"].items():
+                if metric is None:
+                    continue
+                metric_value, source_column_name = metric_info
+                if metric_value is None:
+                    continue
+                perf_batch.append({
+                    "pid": gen_id(), "mid": meta_id, "eid": eid,
+                    "rid": report_id, "rt": report_type,
+                    "rs": row_data["report_set"], "sn": row_data["row_source_sheet"],
+                    "pt": period_type, "pl": payload["period_label"] or "",
+                    "sd": payload["start_date"] or "", "ed": payload["end_date"] or "",
+                    "m": metric, "val": metric_value,
+                    "pgr": payload["peer_group_rank"],
+                    "pgq": payload["peer_group_quartile"],
+                    "srn": int(row_data["row_number"]),
+                    "scn": source_column_name,
+                })
+
+    t1 = time.perf_counter()
     logger.info(
-        f"[loader] report_id={report_id} report_type={report_type} done: "
-        f"meta={len(meta_records)}, entities={inserted_entities}, perf={inserted_perf}"
+        f"[loader] data collection done in {t1-t0:.2f}s: "
+        f"meta={len(meta_batch)}, entity={len(entity_batch)}, "
+        f"size={len(size_batch)}, perf={len(perf_batch)}"
     )
 
-    # 自动从 peer group 名称提取 fund_code 映射，无需任何手工配置
-    # inception_date 来自 pipeline.extract_qw_inception_dates() 的返回值
+    # ------------------------------------------------------------------
+    # 第二步：单事务写入 — DELETE + batch INSERT（全部原子执行）
+    #   若任意步骤抛异常 → rollback → 旧数据自动还原
+    # ------------------------------------------------------------------
+    try:
+        # 清理旧数据（此时尚未 commit，失败可 rollback）
+        db.execute(text("DELETE FROM lc_report_qw_performance  WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text("DELETE FROM lc_report_qw_size_snapshot WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text("DELETE FROM lc_report_qw_entity        WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text("DELETE FROM lc_report_qw_meta          WHERE report_id=:rid"), {"rid": report_id})
+
+        # 批量写入 meta
+        if meta_batch:
+            db.execute(text("""
+                INSERT INTO lc_report_qw_meta
+                    (meta_id, report_id, report_type, report_set, source_filename, sheet_name,
+                     report_name, currency, grouped_by, calculated_on, exported_on, etl_run_id)
+                VALUES (:mid, :rid, :rt, :rs, :sf, :sn, :rn, :cur, :gb, :co, :eo, :eid_)
+            """), meta_batch)
+
+        # 批量写入 entity
+        if entity_batch:
+            db.execute(text("""
+                INSERT INTO lc_report_qw_entity
+                    (entity_id, report_id, report_type, report_set, sheet_name, entity_name,
+                     entity_type, isin, strategy_group, morningstar_rating, morningstar_category,
+                     benchmark, currency, source_row_number, etl_run_id)
+                VALUES (:eid, :rid, :rt, :rs, :sn, :en, :et, :isin, :sg, :mr, :mc, :bm, :cur, :srn, :etl)
+            """), entity_batch)
+
+        # 批量写入 size_snapshot
+        if size_batch:
+            db.execute(text("""
+                INSERT INTO lc_report_qw_size_snapshot
+                    (snapshot_id, entity_id, report_id, report_type,
+                     size_type, snapshot_date, snapshot_value, source_column_name)
+                VALUES (:sid, :eid, :rid, :rt, :st, :sd, :sv, :scn)
+            """), size_batch)
+
+        # 批量写入 performance
+        if perf_batch:
+            db.execute(text("""
+                INSERT INTO lc_report_qw_performance
+                    (perf_id, meta_id, entity_id, report_id, report_type,
+                     report_set, sheet_name, period_type, period_label,
+                     start_date, end_date, metric, value,
+                     peer_group_rank, peer_group_quartile,
+                     source_row_number, source_column_name)
+                VALUES (:pid, :mid, :eid, :rid, :rt,
+                        :rs, :sn, :pt, :pl,
+                        :sd, :ed, :m, :val,
+                        :pgr, :pgq, :srn, :scn)
+            """), perf_batch)
+
+        db.commit()
+
+        t2 = time.perf_counter()
+        logger.info(
+            f"[loader] batch insert done in {t2-t1:.2f}s (total {t2-t0:.2f}s). "
+            f"report_id={report_id} type={report_type}: "
+            f"entities={len(entity_batch)}, perf={len(perf_batch)}"
+        )
+
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            f"[loader] load_to_mysql FAILED for report_id={report_id}, "
+            f"rolled back. Error: {exc}"
+        )
+        raise
+
+    # fund_code_map 在主数据提交后单独更新（ON DUPLICATE KEY UPDATE，天然幂等）
     fund_map_rows = _upsert_fund_code_map(db, report_id, inception_date_map)
 
     return {
-        "report_meta_rows": len(meta_records),
-        "entity_rows_processed": inserted_entities,
-        "performance_rows_changed": inserted_perf,
-        "fund_map_rows": fund_map_rows,
+        "report_meta_rows":         len(meta_batch),
+        "entity_rows_processed":    len(entity_batch),
+        "performance_rows_changed": len(perf_batch),
+        "fund_map_rows":            fund_map_rows,
     }
+
+

@@ -28,5 +28,5 @@ def gen_id() -> int:
         else:
             _last_ts = ts
             _counter = 1
-        seq = _counter % 1000          # 防止溢出，最多999
+        seq = _counter             # 不取模：BIGINT 最多 19 位，单秒超 99999 次极不可能
         return int(f"{ts}{seq:03d}")
