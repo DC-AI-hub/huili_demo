@@ -45,6 +45,52 @@ def _raw(v):
     except (TypeError, ValueError):
         return str(v)
 
+# ---------------------------------------------------------------------------
+# Quartile_weekly 表头固定列顺序（每张 Sheet 分别配置）
+# ---------------------------------------------------------------------------
+_PERIOD_ORDER_BY_SHEET: dict[str, list[str]] = {
+    "VP_PG_HKSFC funds_t-1_inc": [
+        "YTD", "1m", "3m", "4m", "6m", "1y", "2y", "3y", "5y", "10y", "20y",
+        "VPAF (inception)", "CG (inception)", "VPCA (inception)", "VPMF (inception)",
+        "VPHY (inception)", "VCAS (inception)", "VPTF (inception)", "VPGB (inception)",
+        "VPMA (inception)", "VAIF (inception)", "VAIO (inception)", "VATB (inception)",
+        "VACB (inception)", "VPMM (inception)", "VPJR (inception)", "VHCF (inception)",
+    ],
+    "VP_PG_Offshore funds_t-1_Inc": [
+        "YTD", "1m", "3m", "4m", "6m", "1y", "2y", "3y", "5y", "10y", "20y",
+        "VPAF (inception)", "CG (inception)", "VPCA (inception)", "VPMF (inception)",
+        "VPHY (inception)", "VCAS (inception)", "VUHD (inception)", "VPTF (inception)",
+        "VPGB (inception)", "VPMA (inception)", "VAIF (inception)", "VAIO (inception)",
+        "VATB (inception)", "VACB (inception)", "VPMM (inception)", "VPJR (inception)",
+    ],
+    "VP_PG_UCITS Funds_t-1_Inc": [
+        "YTD", "1m", "3m", "4m", "6m", "1y", "2y", "3y", "5y", "10y",
+        "VPEJ (inception)", "VHCF (inception)", "VUGB (inception)", "VUHD (inception)",
+        "VUAD (inception)",
+    ],
+    "RF_fund performance_t-1": [
+        "1m", "3m", "YTD", "1y", "3y", "5y", "10y", "20y",
+        "VPHY (inception)", "VPAF (inception)", "VPGB (inception)", "VAIF (inception)",
+        "VPMM (inception)", "VPMF (inception)", "VPCA (inception)", "CG (inception)",
+        "VHCF (inception)", "VPTF (inception)", "VATB (inception)", "VCAS (inception)",
+        "VUAD (inception)", "VPMA (inception)", "VPJR (inception)", "VAIO (inception)",
+        "VUGB (inception)", "VUHD (inception)", "VACB (inception)", "VPEJ (inception)",
+        "MTIA (inception)",
+    ],
+}
+# 未配置的 sheet 使用默认顺序（与 RF 相同）
+_PERIOD_ORDER_DEFAULT = _PERIOD_ORDER_BY_SHEET["RF_fund performance_t-1"]
+
+
+def _period_sort_key(pg_key: tuple, sheet_name: str = "") -> int:
+    """按对应 sheet 的固定顺序排序 pg_info_map 的 key，未知列排到最后。"""
+    order = _PERIOD_ORDER_BY_SHEET.get(sheet_name, _PERIOD_ORDER_DEFAULT)
+    period_label = pg_key[0]
+    try:
+        return order.index(period_label)
+    except ValueError:
+        return len(order)
+
 
 def _perf_col_header(period_label: str, start_date: str, end_date: str, metric: str, sub: str) -> str:
     """构造 Performance 列头。
@@ -354,7 +400,7 @@ def api_get_parsed_data(
     
     if report_type == "SalesRptByProduct":
         rows = db.execute(
-            text("SELECT * FROM lc_report_sales_flow WHERE report_id=:rid"),
+            text("SELECT * FROM lc_report_sales_flow WHERE report_id=:rid ORDER BY source_row_number"),
             {"rid": report_id}
         ).fetchall()
         keys = ["fund_code", "fund_name", "est_aum_usd_m", 
@@ -443,7 +489,10 @@ def api_get_parsed_data(
                 if pr[4] not in pg_info_map[pg_key]["metrics"]:
                     pg_info_map[pg_key]["metrics"].append(pr[4])
 
-            for pg_key, pg_info in pg_info_map.items():
+            # 按当前 sheet 的固定列顺序排序
+            sorted_pg_items = sorted(pg_info_map.items(), key=lambda kv: _period_sort_key(kv[0], sheet_name))
+
+            for pg_key, pg_info in sorted_pg_items:
                 period_label, start_date, end_date = pg_key
                 first_metric = pg_info["metrics"][0]
                 # 每个 metric 生成一个 value 列
