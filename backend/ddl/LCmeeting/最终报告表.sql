@@ -154,5 +154,5 @@ CREATE TABLE `lc_fund_performance` (
     
     PRIMARY KEY (`id`),
     -- 创建唯一索引，用于防重和实现 Upsert 更新
-    UNIQUE KEY `uk_as_of_date_fund` (`as_of_date`, `fund_code`, `fund_name`)
+    UNIQUE KEY `uk_as_of_date_fund` (`report_date`, `as_of_date`, `fund_code`, `fund_name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金月度业绩报告表(原始数据)';

@@ -59,9 +59,9 @@ def _upsert_meta(db: Session, report_id: int, report_type: str, row: Dict[str, A
     existing = db.execute(
         text("""
             SELECT meta_id FROM lc_report_fa_meta
-            WHERE source_filename=:sf AND sheet_name=:sn AND calculated_on=:co
+            WHERE report_id=:rid AND source_filename=:sf AND sheet_name=:sn AND calculated_on=:co
         """),
-        {"sf": row["source_filename"], "sn": row["sheet_name"], "co": row["calculated_on"]},
+        {"rid": report_id, "sf": row["source_filename"], "sn": row["sheet_name"], "co": row["calculated_on"]},
     ).fetchone()
 
     if existing:
@@ -142,11 +142,11 @@ def _upsert_perf(
     existing = db.execute(
         text("""
             SELECT perf_id FROM lc_report_fa_performance
-            WHERE meta_id=:mid AND entity_name=:en AND isin=:isin
+            WHERE report_id=:rid AND meta_id=:mid AND entity_name=:en AND isin=:isin
               AND metric=:m AND period_type=:pt AND start_date=:sd AND end_date=:ed
         """),
         {
-            "mid": meta_id, "en": entity_name, "isin": isin,
+            "rid": report_id, "mid": meta_id, "en": entity_name, "isin": isin,
             "m": metric, "pt": period_type, "sd": start_date, "ed": end_date,
         },
     ).fetchone()

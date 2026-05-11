@@ -81,9 +81,9 @@ def load_sales_flow_to_mysql(
         existing = db.execute(
             text("""
                 SELECT flow_id FROM lc_report_sales_flow
-                WHERE report_date=:rd AND source_filename=:sf AND fund_code=:fc
+                WHERE report_id=:rid AND report_date=:rd AND source_filename=:sf AND fund_code=:fc
             """),
-            {"rd": report_date, "sf": source_filename, "fc": fund_code},
+            {"rid": report_id, "rd": report_date, "sf": source_filename, "fc": fund_code},
         ).fetchone()
 
         if existing:

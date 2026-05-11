@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS lc_report_sales_flow (
     updated_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                             ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
     PRIMARY KEY (flow_id),
-    UNIQUE KEY uq_lc_report_sales_flow (report_date, source_filename, fund_code),
+    UNIQUE KEY uq_lc_report_sales_flow (report_id, report_date, source_filename, fund_code),
     KEY idx_lc_report_sales_flow_report (report_id),
     KEY idx_lc_report_sales_flow_date (report_date),
     KEY idx_lc_report_sales_flow_code (fund_code)
@@ -263,7 +263,7 @@ CREATE TABLE IF NOT EXISTS lc_report_fa_meta (
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
     PRIMARY KEY (meta_id),
-    UNIQUE KEY uq_lc_report_fa_meta (source_filename, sheet_name, calculated_on),
+    UNIQUE KEY uq_lc_report_fa_meta (report_id, source_filename, sheet_name, calculated_on),
     KEY idx_lc_report_fa_meta_report (report_id),
     KEY idx_lc_report_fa_meta_set (report_set, sheet_name, snapshot_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
@@ -299,7 +299,7 @@ CREATE TABLE IF NOT EXISTS lc_report_fa_performance (
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
     PRIMARY KEY (perf_id),
-    UNIQUE KEY uq_lc_report_fa_perf (meta_id, entity_name, isin, metric, period_type, start_date, end_date),
+    UNIQUE KEY uq_lc_report_fa_perf (report_id, meta_id, entity_name, isin, metric, period_type, start_date, end_date),
     KEY idx_lc_report_fa_perf_meta (meta_id),
     KEY idx_lc_report_fa_perf_report (report_id),
     KEY idx_lc_report_fa_perf_entity (entity_name(64))
