@@ -36,10 +36,16 @@ cd /home/huili_demo/backend
    pip3 install -r requirements.txt
    ```
 
-4. **后台运行 FastAPI 服务：**
-   使用 `uvicorn` 在 `0.0.0.0:8000` 端口启动服务：
+4. **退出虚拟环境：**
+   依赖安装完成后，可退出虚拟环境：
    ```bash
-   nohup uvicorn main:app --host 0.0.0.0 --port 8000 &
+   deactivate
+   ```
+
+5. **后台运行 FastAPI 服务：**
+   指定虚拟环境内的 `uvicorn` 路径，在 `0.0.0.0:8000` 端口启动服务：
+   ```bash
+   nohup huili_demo_venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 &
    ```
 
 *(注：代码内的 `main.py` 已经适配了跨平台路径加载 `utils/` 下的飞书同步脚本。当检测到 Linux 系统时会自动通过 `huili_demo_venv/bin/python` 调用子脚本。)*
@@ -50,9 +56,9 @@ cd /home/huili_demo/backend
    ```bash
    cd /home/huili_demo/frontend
    ```
-2. 安装 NPM 依赖：
+2. 安装 NPM 依赖（忽略冲突）：
    ```bash
-   npm install
+   npm install --legacy-peer-deps
    ```
 3. 编译打包：
    ```bash

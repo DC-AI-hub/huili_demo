@@ -45,7 +45,7 @@
         <div class="sheet-body" :style="{ visibility: (leftLoading || leftError) ? 'hidden' : 'visible' }">
           <iframe 
             id="iframe-luckysheet-left" 
-            src="/luckysheet-frame.html" 
+            :src="iframeUrl" 
             style="margin:0;padding:0;position:absolute;width:100%;height:100%;border:none;">
           </iframe>
         </div>
@@ -117,15 +117,72 @@ const isFundAnalysis = computed(() => faSheets.value.length > 0)
 // ── 左侧状态 ───────────────────────────────────────────
 const leftLoading = ref(true)
 const leftError = ref('')
+const iframeUrl = ref('')
+
+const luckysheetFrameHtml = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Luckysheet Frame</title>
+  <!-- Luckysheet 依赖 -->
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/css/pluginsCss.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/plugins.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/css/luckysheet.css' />
+  <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/assets/iconfont/iconfont.css' />
+  <script src="https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/plugins/js/plugin.js"></scr` + `ipt>
+  <script src="https://cdn.jsdelivr.net/npm/luckysheet@latest/dist/luckysheet.umd.js"></scr` + `ipt>
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    #luckysheet-container { width: 100%; height: 100%; position: absolute; }
+  </style>
+</head>
+<body>
+  <div id="luckysheet-container"></div>
+  <script>
+    // 通知父窗口已准备就绪
+    window.parent.postMessage({ type: 'luckysheet-frame-ready' }, '*');
+
+    // 监听来自 Vue 父组件的消息
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (data && data.type === 'init-luckysheet') {
+        const payload = data.payload;
+        if (window.luckysheet) {
+          window.luckysheet.create({
+            container: 'luckysheet-container',
+            lang: 'zh',
+            showinfobar: false,
+            showtoolbar: false,
+            showstatisticBar: false,
+            sheetFormulaBar: false,
+            enableAddRow: false,
+            enableAddBackTop: false,
+            data: payload.sheets,
+            title: payload.title || '原始 Excel',
+            userInfo: payload.userInfo || ''
+          });
+        }
+      }
+    });
+  </scr` + `ipt>
+</body>
+</html>`
 
 // ── 生命周期 ───────────────────────────────────────────
 onMounted(async () => {
+  const blob = new Blob([luckysheetFrameHtml], { type: 'text/html' })
+  iframeUrl.value = URL.createObjectURL(blob)
+
   // 由于采用了 iframe 物理隔离，左右两边完全不需要再加串行锁了，直接并发飞起！
   initLeftPanel()
   initRightPanel()
 })
 
 onBeforeUnmount(() => {
+  if (iframeUrl.value) {
+    URL.revokeObjectURL(iframeUrl.value)
+  }
   if (window.luckysheet) {
     try { window.luckysheet.destroy() } catch (_) {}
   }
