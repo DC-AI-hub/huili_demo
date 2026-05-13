@@ -85,6 +85,29 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
 
         result = []
         for r in rows:
+            no_bm = (r.benchmark and r.benchmark.strip().lower() == "no benchmark")
+
+            ytd_bm = None if (no_bm or r.ytd_fund is None) else r.ytd_bm
+            ytd_excess = None if ytd_bm is None else r.ytd_excess
+            
+            one_y_bm = None if (no_bm or r.one_y_fund is None) else r.one_y_bm
+            one_y_excess = None if one_y_bm is None else r.one_y_excess
+            
+            ann_3y_bm = None if (no_bm or r.ann_3y_fund is None) else r.ann_3y_bm
+            ann_3y_excess = None if ann_3y_bm is None else r.ann_3y_excess
+            
+            ann_5y_bm = None if (no_bm or r.ann_5y_fund is None) else r.ann_5y_bm
+            ann_5y_excess = None if ann_5y_bm is None else r.ann_5y_excess
+            
+            ann_10y_bm = None if (no_bm or r.ann_10y_fund is None) else r.ann_10y_bm
+            ann_10y_excess = None if ann_10y_bm is None else r.ann_10y_excess
+            
+            ann_20y_bm = None if (no_bm or r.ann_20y_fund is None) else r.ann_20y_bm
+            ann_20y_excess = None if ann_20y_bm is None else r.ann_20y_excess
+            
+            since_inc_bm = None if (no_bm or r.since_inc_fund is None) else r.since_inc_bm
+            since_inc_excess = None if since_inc_bm is None else r.since_inc_excess
+
             result.append({
                 "id":            r.id,
                 "as_of_date":    r.as_of_date.isoformat() if r.as_of_date else None,
@@ -95,32 +118,32 @@ def get_lc_fund_performance(as_of_date: Optional[str] = None):
                 "aum_vp_pct":    _fmt_vp_pct(r.aum_vp_pct),
                 # YTD
                 "ytd_fund":      _fmt_pct(r.ytd_fund),
-                "ytd_bm":        _fmt_pct(r.ytd_bm),
-                "ytd_excess":    _fmt_pct(r.ytd_excess),
+                "ytd_bm":        _fmt_pct(ytd_bm),
+                "ytd_excess":    _fmt_pct(ytd_excess),
                 # 1Y
                 "1y_fund":       _fmt_pct(r.one_y_fund),
-                "1y_bm":         _fmt_pct(r.one_y_bm),
-                "1y_excess":     _fmt_pct(r.one_y_excess),
+                "1y_bm":         _fmt_pct(one_y_bm),
+                "1y_excess":     _fmt_pct(one_y_excess),
                 # Ann 3Y
                 "ann_3y_fund":   _fmt_pct(r.ann_3y_fund),
-                "ann_3y_bm":     _fmt_pct(r.ann_3y_bm),
-                "ann_3y_excess": _fmt_pct(r.ann_3y_excess),
+                "ann_3y_bm":     _fmt_pct(ann_3y_bm),
+                "ann_3y_excess": _fmt_pct(ann_3y_excess),
                 # Ann 5Y
                 "ann_5y_fund":   _fmt_pct(r.ann_5y_fund),
-                "ann_5y_bm":     _fmt_pct(r.ann_5y_bm),
-                "ann_5y_excess": _fmt_pct(r.ann_5y_excess),
+                "ann_5y_bm":     _fmt_pct(ann_5y_bm),
+                "ann_5y_excess": _fmt_pct(ann_5y_excess),
                 # Ann 10Y
                 "ann_10y_fund":   _fmt_pct(r.ann_10y_fund),
-                "ann_10y_bm":     _fmt_pct(r.ann_10y_bm),
-                "ann_10y_excess": _fmt_pct(r.ann_10y_excess),
+                "ann_10y_bm":     _fmt_pct(ann_10y_bm),
+                "ann_10y_excess": _fmt_pct(ann_10y_excess),
                 # Ann 20Y
                 "ann_20y_fund":   _fmt_pct(r.ann_20y_fund),
-                "ann_20y_bm":     _fmt_pct(r.ann_20y_bm),
-                "ann_20y_excess": _fmt_pct(r.ann_20y_excess),
+                "ann_20y_bm":     _fmt_pct(ann_20y_bm),
+                "ann_20y_excess": _fmt_pct(ann_20y_excess),
                 # Since Inception
                 "since_inc_fund":   _fmt_pct(r.since_inc_fund),
-                "since_inc_bm":     _fmt_pct(r.since_inc_bm),
-                "since_inc_excess": _fmt_pct(r.since_inc_excess),
+                "since_inc_bm":     _fmt_pct(since_inc_bm),
+                "since_inc_excess": _fmt_pct(since_inc_excess),
                 "inception_date":   (
                     f"{r.inception_date.day}-{r.inception_date.strftime('%b')}-{r.inception_date.strftime('%y')}"
                     if r.inception_date else None
@@ -210,8 +233,20 @@ def get_aum_report(as_of_date: Optional[str] = None):
             .all()
         ) if report_date else []
 
+        # ── 获取 Benchmark 映射 ────────────────────────────────────
+        fund_benchmark_map = {}
+        if report_date:
+            bm_rows = db.query(LcFundPerformance.fund_name, LcFundPerformance.benchmark)\
+                .filter(LcFundPerformance.report_date == report_date).all()
+            for row in bm_rows:
+                if row.fund_name:
+                    fund_benchmark_map[row.fund_name] = row.benchmark
+
         ratings = []
         for r in ratings_raw:
+            bm = fund_benchmark_map.get(r.fund_name)
+            no_bm = (bm and bm.strip().lower() == "no benchmark")
+
             ratings.append({
                 "id":           r.id,
                 "fund_name":    r.fund_name,
@@ -225,13 +260,13 @@ def get_aum_report(as_of_date: Optional[str] = None):
                 "ms_rank_10y":  r.ms_rank_10y,
                 "ms_rank_20y":  r.ms_rank_20y,
                 "ms_rank_si":   r.ms_rank_si,
-                "vs_bmk_ytd":   r.vs_bmk_ytd,
-                "vs_bmk_1y":    r.vs_bmk_1y,
-                "vs_bmk_3y":    r.vs_bmk_3y,
-                "vs_bmk_5y":    r.vs_bmk_5y,
-                "vs_bmk_10y":   r.vs_bmk_10y,
-                "vs_bmk_20y":   r.vs_bmk_20y,
-                "vs_bmk_si":    r.vs_bmk_si,
+                "vs_bmk_ytd":   "No BMK" if no_bm else r.vs_bmk_ytd,
+                "vs_bmk_1y":    "No BMK" if no_bm else r.vs_bmk_1y,
+                "vs_bmk_3y":    "No BMK" if no_bm else r.vs_bmk_3y,
+                "vs_bmk_5y":    "No BMK" if no_bm else r.vs_bmk_5y,
+                "vs_bmk_10y":   "No BMK" if no_bm else r.vs_bmk_10y,
+                "vs_bmk_20y":   "No BMK" if no_bm else r.vs_bmk_20y,
+                "vs_bmk_si":    "No BMK" if no_bm else r.vs_bmk_si,
             })
 
         # ── Performance Summary ───────────────────────────────────

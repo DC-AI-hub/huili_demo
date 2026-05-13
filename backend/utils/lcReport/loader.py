@@ -728,7 +728,9 @@ def load_to_mysql(
         raise
 
     # fund_code_map 在主数据提交后单独更新（ON DUPLICATE KEY UPDATE，天然幂等）
-    fund_map_rows = _upsert_fund_code_map(db, report_id, inception_date_map)
+    # 用户要求：解析入库时，不要再自动插入更新 lc_fund_code_map 表，改为手动维护
+    # fund_map_rows = _upsert_fund_code_map(db, report_id, inception_date_map)
+    fund_map_rows = 0
 
     return {
         "report_meta_rows":         len(meta_batch),

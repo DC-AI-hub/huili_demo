@@ -261,26 +261,27 @@ def load_fa_to_mysql(
 
     # 写入 fund_code 映射表（如果提供）
     fund_map_rows = 0
-    if fund_map_df is not None and not fund_map_df.empty:
-        for rec in fund_map_df.to_dict("records"):
-            db.execute(
-                text("""
-                    INSERT INTO lc_fund_code_map (fund_code, entity_name, isin)
-                    VALUES (:fc, :en, :isin)
-                    ON DUPLICATE KEY UPDATE
-                        entity_name = VALUES(entity_name),
-                        isin        = VALUES(isin),
-                        updated_at  = NOW()
-                """),
-                {
-                    "fc":   str(rec["fund_code"]),
-                    "en":   str(rec["entity_name"]),
-                    "isin": str(rec.get("isin") or ""),
-                },
-            )
-            fund_map_rows += 1
-        db.commit()
-        logger.info(f"[fa_loader] lc_fund_code_map upserted: {fund_map_rows} rows")
+    # 用户要求：解析入库时，不要再自动插入更新 lc_fund_code_map 表，改为手动维护
+    # if fund_map_df is not None and not fund_map_df.empty:
+    #     for rec in fund_map_df.to_dict("records"):
+    #         db.execute(
+    #             text("""
+    #                 INSERT INTO lc_fund_code_map (fund_code, entity_name, isin)
+    #                 VALUES (:fc, :en, :isin)
+    #                 ON DUPLICATE KEY UPDATE
+    #                     entity_name = VALUES(entity_name),
+    #                     isin        = VALUES(isin),
+    #                     updated_at  = NOW()
+    #             """),
+    #             {
+    #                 "fc":   str(rec["fund_code"]),
+    #                 "en":   str(rec["entity_name"]),
+    #                 "isin": str(rec.get("isin") or ""),
+    #             },
+    #         )
+    #         fund_map_rows += 1
+    #     db.commit()
+    #     logger.info(f"[fa_loader] lc_fund_code_map upserted: {fund_map_rows} rows")
 
     return {
         "fa_meta_rows":        len(meta_df),
