@@ -1,21 +1,29 @@
 {
   "period_patterns": [
     "^YTD",
+    "^MTD",
+    "^[0-9]+d",
+    "^[0-9]+w",
     "^[0-9]+m",
     "^[0-9]+y",
-    ".*\\(inception\\)$"
+    "^20[0-9]{2}",
+    "(?i)^.*inception.*?(?=_|$)",
+    "(?i)^.*since.*?(?=_|$)"
   ],
   "metric_patterns": {
     "return_cum": "Return \\(Cumulative\\)",
-    "return_ann": "Return \\(Annualized\\)"
+    "return_ann": "Return \\(Annualized\\)",
+    "std_dev_ann": "Std Dev \\(Annualized\\)"
   },
   "peer_patterns": {
     "peer_group_rank": "Peer group rank",
     "peer_group_quartile": "Peer group quartile"
   },
   "size_patterns": {
-    "daily": "Fund Size - comprehensive \\(Daily\\)",
-    "monthly": "Fund Size - comprehensive \\(Monthly\\)"
+    "monthly": "Fund Size - comprehensive \\(Monthly\\)(?!.*(Morningstar|ISIN|Currency|Benchmark|Category|Group|Base))",
+    "daily": "(^Fund Size$|Fund Size - comprehensive \\(Daily\\))",
+    "daily_date": "^Fund Size Date$",
+    "base_currency": "^Base Currency$"
   },
-  "date_pattern": "(\\d{1,2}/\\d{1,2}/\\d{4})"
+  "date_pattern": "(\\d{1,2}/\\d{1,2}/\\d{4}|\\d{1,2}/\\d{4})"
 }

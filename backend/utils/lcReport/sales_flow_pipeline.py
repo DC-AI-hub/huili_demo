@@ -210,9 +210,16 @@ def run_sales_flow_pipeline(
     skipped_non_product = 0
     skipped_invalid_numeric = 0
 
+    current_group = ""
+
     # ---- 逐行解析 ----
     for row_idx in range(len(df)):
         row = df.iloc[row_idx]
+        
+        group_val = _to_text(row.iloc[0])
+        if group_val:
+            current_group = group_val
+            
         fund_code = _to_text(row.iloc[COLUMN_MAP["fund_code"]])
         fund_name = _to_text(row.iloc[COLUMN_MAP["fund_name"]])
 
@@ -231,6 +238,7 @@ def run_sales_flow_pipeline(
                 "report_date":            report_date,
                 "source_filename":        source_filename,
                 "etl_run_id":             etl_run_id,
+                "group_name":             current_group,
                 "fund_code":              effective_code,
                 "fund_name":              fund_name,
                 "est_aum_usd_m":          _to_float(row.iloc[COLUMN_MAP["est_aum_usd_m"]]),

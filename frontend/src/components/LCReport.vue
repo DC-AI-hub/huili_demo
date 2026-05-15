@@ -194,6 +194,24 @@
                     </button>
                   </div>
                 </div>
+
+                <div class="check-item full-width-item" v-if="report.items.SalesRptByProduct.isChecked">
+                  <div class="item-left">
+                    <span class="status-icon">⚙️</span>
+                    <span class="item-name">基金配置核对</span>
+                    <div class="alert-group" v-if="newFundCount > 0 || diffFundCount > 0">
+                      <span class="alert-pill combined-alert">
+                        <span class="material-symbols-outlined">error</span>
+                        <template v-if="newFundCount > 0">{{ newFundCount }} 新基金</template>
+                        <template v-if="newFundCount > 0 && diffFundCount > 0"> | </template>
+                        <template v-if="diffFundCount > 0">{{ diffFundCount }} 基金有差异</template>
+                      </span>
+                    </div>
+                  </div>
+                  <div class="item-actions">
+                    <button class="btn-sm btn-verify" @click="openFundCodeMapModal(report)">核对</button>
+                  </div>
+                </div>
               </div>
 
               <div class="card-footer">
@@ -272,6 +290,12 @@
       @close="closeVerifyModal"
       @verified="onVerified"
     />
+
+    <LCFundCodeMapModal
+      v-if="showFundCodeMapModal"
+      :report-date="currentFundMapReportDate"
+      @close="onFundCodeMapModalClose"
+    />
   </div>
 </template>
 
@@ -281,6 +305,7 @@ import { useRouter } from 'vue-router'
 import { VueDatePicker } from '@vuepic/vue-datepicker'
 import '@vuepic/vue-datepicker/dist/main.css'
 import LCReportCompare from './LCReportCompare.vue'
+import LCFundCodeMapModal from './LCFundCodeMapModal.vue'
 
 const router = useRouter()
 const BASE = '/api/lc-report'
@@ -387,7 +412,11 @@ const filteredReports = computed(() =>
 )
 
 const handleQuery = () => fetchReports()
-onMounted(() => fetchReports())
+onMounted(() => {
+  fetchReports()
+  fetchNewFundCount()
+  fetchDiffFundCount()
+})
 
 // ─── 新增报告 ─────────────────────────────────────────────────
 const showNewReportModal = ref(false)
@@ -545,6 +574,8 @@ function startPolling(fileId, reportId, itemKey) {
           if (json.data.parse_error) {
             alert(`解析失败：\n${json.data.parse_error}`)
           }
+          fetchNewFundCount()
+          fetchDiffFundCount()
         }
       }
     } catch (_) { /* 静默 */ }
@@ -556,6 +587,47 @@ function startPolling(fileId, reportId, itemKey) {
 const showVerifyModal = ref(false)
 const currentVerifyReport = ref(null)
 const currentVerifyItem = ref('')
+
+const showFundCodeMapModal = ref(false)
+const currentFundMapReportDate = ref('')
+
+function openFundCodeMapModal(report) {
+  currentFundMapReportDate.value = report.reportTime
+  showFundCodeMapModal.value = true
+}
+
+const newFundCount = ref(0)
+const diffFundCount = ref(0)
+
+async function fetchNewFundCount() {
+  try {
+    const res = await fetch(`${BASE}/fund-code-map/new-count`)
+    const json = await res.json()
+    if (json.success) {
+      newFundCount.value = json.count
+    }
+  } catch (e) {
+    console.error('获取新基金数量失败:', e)
+  }
+}
+
+async function fetchDiffFundCount() {
+  try {
+    const res = await fetch(`${BASE}/fund-code-map/diff-count`)
+    const json = await res.json()
+    if (json.success) {
+      diffFundCount.value = json.count
+    }
+  } catch (e) {
+    console.error('获取信息不一致基金数量失败:', e)
+  }
+}
+
+function onFundCodeMapModalClose() {
+  showFundCodeMapModal.value = false
+  fetchNewFundCount()
+  fetchDiffFundCount()
+}
 
 function openVerifyModal(report, itemKey) {
   currentVerifyReport.value = report
@@ -873,8 +945,8 @@ h1, h2, h3, h4, .font-headline {
 
 .cards-section {
   display: grid;
-  /* 自动放 3 列：空间够就 3 列，不够就自动降级到 2/1 列 */
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  /* 默认 2 列 */
+  grid-template-columns: repeat(2, 1fr);
   gap: 1.25rem;
 }
 
@@ -1060,11 +1132,6 @@ h1, h2, h3, h4, .font-headline {
   cursor: not-allowed;
 }
 
-@media (max-width: 980px) {
-  .cards-section {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
 
 @media (max-width: 640px) {
   .cards-section {
@@ -1231,4 +1298,37 @@ h1, h2, h3, h4, .font-headline {
 .slb-ARCHIVED { background: #e2e8f0; color: #475569; }
 
 
+.alert-group {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-left: 0.25rem;
+}
+
+.alert-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+}
+
+.alert-pill .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.alert-pill.combined-alert {
+  background-color: #fee2e2;
+  color: #b91c1c;
+  animation: pulse-soft 2s infinite;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
 </style>

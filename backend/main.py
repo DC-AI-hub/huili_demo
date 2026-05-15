@@ -62,6 +62,9 @@ app.include_router(factsheet_router, prefix="/api")
 app.include_router(lc_meeting_router, prefix="/api")
 app.include_router(lc_report_router, prefix="/api")
 
+from routers.fund_code_map import router as fund_code_map_router
+app.include_router(fund_code_map_router, prefix="/api/lc-report")
+
 # -------------------------------------------------------
 # Static Frontend Files
 # -------------------------------------------------------

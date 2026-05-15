@@ -11,6 +11,8 @@
 -- 删表（按依赖逆序：子表在前，主表在后）
 -- =============================================================
 DROP TABLE IF EXISTS lc_report_fa_performance;
+DROP TABLE IF EXISTS lc_report_fa_size_snapshot;
+DROP TABLE IF EXISTS lc_report_fa_entity;
 DROP TABLE IF EXISTS lc_report_fa_meta;
 DROP TABLE IF EXISTS lc_report_sales_flow;
 DROP TABLE IF EXISTS lc_report_qw_performance;
@@ -151,8 +153,9 @@ CREATE TABLE IF NOT EXISTS lc_report_qw_size_snapshot (
     report_type         VARCHAR(50)     NOT NULL COMMENT '报告类型',
     size_type           VARCHAR(20)     NOT NULL COMMENT '规模类型：daily-日规模 / monthly-月规模',
     snapshot_date       VARCHAR(20)     NOT NULL COMMENT '快照日期（ISO格式，如 2026-04-15）',
-    snapshot_value      DECIMAL(30,10)  NULL     COMMENT '规模数值（单位 mn USD）',
+    snapshot_value      VARCHAR(100)    NULL     COMMENT '规模数值（原单位 mn USD）或日期格式',
     source_column_name  VARCHAR(200)    NULL     COMMENT '来源列名（溯源用）',
+    source_col_number   INT             NULL     COMMENT '数据来源列号（排序/溯源用）',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
@@ -187,6 +190,7 @@ CREATE TABLE IF NOT EXISTS lc_report_qw_performance (
     peer_group_quartile DECIMAL(20,10)  NULL     COMMENT '四分位数',
     source_row_number   INT             NULL     COMMENT '数据来源行号（溯源用）',
     source_column_name  VARCHAR(200)    NULL     COMMENT '数据来源列名（溯源用）',
+    source_col_number   INT             NULL     COMMENT '数据来源列号（排序/溯源用）',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
@@ -238,96 +242,150 @@ CREATE TABLE IF NOT EXISTS lc_report_sales_flow (
 
 
 -- -------------------------------------------------------------
--- 8. lc_report_fa_meta  Fund Analysis 快照元数据表
---    作用：每个 "Calculated on:" 块一条记录（多快照永久共存）
---    幂等键：(source_filename, sheet_name, calculated_on)
+-- 8. lc_report_fa_meta  Fund Analysis 报表元数据表
+--    作用：记录 Excel 每张 Sheet 层面的宏观配置信息
+--    关联键：(report_id, report_type) 对应 lc_report_file 的记录
 -- -------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS lc_report_fa_meta (
-    meta_id             BIGINT          NOT NULL COMMENT '主键，格式：YYYYMMDDHHmmss + 3位序号',
+    meta_id         BIGINT          NOT NULL COMMENT '主键，格式：YYYYMMDDHHmmss + 3位序号',
+    report_id       BIGINT          NOT NULL COMMENT '关联报告ID（对应 lc_report.report_id）',
+    report_type     VARCHAR(50)     NOT NULL DEFAULT 'FundAnalysis' COMMENT '报告类型',
+    report_set      VARCHAR(100)    NOT NULL COMMENT '报表集合名（通常为文件名去扩展名）',
+    source_filename VARCHAR(255)    NOT NULL COMMENT '原始 Excel 文件名',
+    sheet_name      VARCHAR(100)    NOT NULL COMMENT 'Sheet 页名称',
+    report_name     VARCHAR(255)    NULL     COMMENT '报表名称（Sheet 首行文本）',
+    currency        VARCHAR(10)     NULL     COMMENT '货币单位（如 USD / HKD / CNY）',
+    grouped_by      VARCHAR(100)    NULL     COMMENT '分组方式（如 Strategy Group）',
+    calculated_on   VARCHAR(50)     NOT NULL DEFAULT '' COMMENT 'Calculated on 日期时间（原始文本）',
+    exported_on     VARCHAR(50)     NOT NULL DEFAULT '' COMMENT 'Exported on 日期时间（原始文本）',
+    etl_run_id      VARCHAR(64)     NULL     COMMENT 'ETL运行批次ID',
+    created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+    PRIMARY KEY (meta_id),
+    UNIQUE KEY uq_lc_report_fa_meta (report_id, report_type, sheet_name),
+    KEY idx_lc_report_fa_meta_report (report_id),
+    KEY idx_lc_report_fa_meta_set (report_set)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='FundAnalysis 报表元数据表，每张 Sheet 一条记录';
+
+
+-- -------------------------------------------------------------
+-- 9. lc_report_fa_entity  Fund Analysis 基金实体主数据表
+--    作用：存储基金的主数据，包含 ISIN、评级、基准等信息
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lc_report_fa_entity (
+    entity_id           BIGINT          NOT NULL COMMENT '主键，格式：YYYYMMDDHHmmss + 3位序号',
     report_id           BIGINT          NOT NULL COMMENT '关联报告ID（对应 lc_report.report_id）',
     report_type         VARCHAR(50)     NOT NULL DEFAULT 'FundAnalysis' COMMENT '报告类型',
-    report_set          VARCHAR(200)    NOT NULL COMMENT '文件名去扩展名（批次标识）',
-    source_filename     VARCHAR(255)    NOT NULL COMMENT '原始文件名（溯源）',
-    sheet_name          VARCHAR(100)    NOT NULL COMMENT 'Excel Sheet 名称',
-    snapshot_type       VARCHAR(10)     NOT NULL COMMENT '快照序号：t0=最新 / t1=上一期 / t2...',
-    snapshot_date       VARCHAR(20)     NOT NULL COMMENT '快照日期（calculated_on 日期部分）',
-    calculated_on       VARCHAR(30)     NOT NULL COMMENT 'Calculated on: 完整时间戳（历史快照唯一边界）',
-    calculated_date     VARCHAR(20)     NOT NULL COMMENT '计算日期',
-    calculated_time     VARCHAR(20)     NOT NULL COMMENT '计算时间',
-    exported_on         VARCHAR(30)     NULL     COMMENT 'Exported on: 时间戳',
-    currency            VARCHAR(50)     NOT NULL DEFAULT 'US Dollar' COMMENT '货币单位',
-    grouped_by          VARCHAR(200)    NULL     COMMENT '分组方式（如 Morningstar Category）',
-    investments_filter  TEXT            NULL     COMMENT 'Investments: 筛选条件（完整文本）',
-    etl_run_id          VARCHAR(64)     NULL     COMMENT 'ETL 运行批次ID（UUID）',
+    report_set          VARCHAR(100)    NOT NULL COMMENT '报表集合名',
+    sheet_name          VARCHAR(100)    NOT NULL COMMENT '来源 Sheet 名',
+    entity_name         VARCHAR(255)    NOT NULL COMMENT '基金/实体名称（Group/Investment 列）',
+    entity_type         VARCHAR(20)     NOT NULL DEFAULT 'fund' COMMENT '实体类型：fund=基金, benchmark=基准, peer_avg=同组平均, peer_count=同组数量',
+    isin                VARCHAR(20)     NOT NULL DEFAULT '' COMMENT 'ISIN 国际证券识别码（为空时存空字符串）',
+    strategy_group      VARCHAR(1000)   NULL     COMMENT '策略分组（如 China Equities）',
+    morningstar_rating  VARCHAR(10)     NULL     COMMENT '晨星评级（如 ★★★★★）',
+    morningstar_category VARCHAR(100)  NULL     COMMENT '晨星分类',
+    benchmark           VARCHAR(255)   NULL     COMMENT '基准指数',
+    currency            VARCHAR(10)    NULL     COMMENT '货币',
+    source_row_number   INT            NULL     COMMENT '数据来源行号（溯源用）',
+    etl_run_id          VARCHAR(64)    NULL     COMMENT 'ETL运行批次ID',
+    created_at          DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at          DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+    PRIMARY KEY (entity_id),
+    KEY idx_lc_report_fa_entity_report (report_id),
+    KEY idx_lc_report_fa_entity_lookup (report_set, sheet_name, entity_name),
+    KEY idx_lc_report_fa_entity_type (entity_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+  COMMENT='FundAnalysis 基金实体主数据表';
+
+
+-- -------------------------------------------------------------
+-- 10. lc_report_fa_size_snapshot  Fund Analysis 基金规模快照表
+--    作用：存储基金不同日期的规模数据（daily / monthly 类型）
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS lc_report_fa_size_snapshot (
+    snapshot_id         BIGINT          NOT NULL COMMENT '主键，格式：YYYYMMDDHHmmss + 3位序号',
+    entity_id           BIGINT          NOT NULL COMMENT '关联基金实体ID（对应 lc_report_fa_entity.entity_id）',
+    report_id           BIGINT          NOT NULL COMMENT '关联报告ID',
+    report_type         VARCHAR(50)     NOT NULL DEFAULT 'FundAnalysis' COMMENT '报告类型',
+    size_type           VARCHAR(20)     NOT NULL COMMENT '规模类型：daily-日规模 / monthly-月规模',
+    snapshot_date       VARCHAR(20)     NOT NULL COMMENT '快照日期（ISO格式，如 2026-04-15）',
+    snapshot_value      VARCHAR(100)    NULL     COMMENT '规模数值（原单位 mn USD）或日期格式',
+    source_column_name  VARCHAR(200)    NULL     COMMENT '来源列名（溯源用）',
+    source_col_number   INT             NULL     COMMENT '数据来源列号（排序/溯源用）',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
-    PRIMARY KEY (meta_id),
-    UNIQUE KEY uq_lc_report_fa_meta (report_id, source_filename, sheet_name, calculated_on),
-    KEY idx_lc_report_fa_meta_report (report_id),
-    KEY idx_lc_report_fa_meta_set (report_set, sheet_name, snapshot_type)
+    PRIMARY KEY (snapshot_id),
+    UNIQUE KEY uq_lc_report_fa_snapshot (entity_id, size_type, snapshot_date),
+    KEY idx_lc_report_fa_snapshot_entity (entity_id),
+    KEY idx_lc_report_fa_snapshot_report (report_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-  COMMENT='Fund Analysis 快照元数据表，每个 Calculated on 块一条，多快照永久共存';
+  COMMENT='FundAnalysis 基金规模快照表，按日期和类型存储规模数据';
 
 
 -- -------------------------------------------------------------
--- 9. lc_report_fa_performance  Fund Analysis 基金表现明细表
---    作用：按快照×基金×周期×指标存储表现数据
---    幂等键：(meta_id, entity_name, isin, metric, period_type, start_date, end_date)
---    注意：不同快照（meta_id 不同）数据永久保留，不互相覆盖
+-- 11. lc_report_fa_performance  Fund Analysis 表现与排名明细表
+--    作用：将多维度组合结构（收益、排名、四分位）降维为行级指标
 -- -------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS lc_report_fa_performance (
     perf_id             BIGINT          NOT NULL COMMENT '主键，格式：YYYYMMDDHHmmss + 3位序号',
-    meta_id             BIGINT          NOT NULL COMMENT '关联快照元数据ID（对应 lc_report_fa_meta.meta_id）',
-    report_id           BIGINT          NOT NULL COMMENT '关联报告ID（冗余，方便查询）',
+    meta_id             BIGINT          NOT NULL COMMENT '关联元数据ID（对应 lc_report_fa_meta.meta_id）',
+    entity_id           BIGINT          NOT NULL COMMENT '关联基金实体ID（对应 lc_report_fa_entity.entity_id）',
+    report_id           BIGINT          NOT NULL COMMENT '关联报告ID',
     report_type         VARCHAR(50)     NOT NULL DEFAULT 'FundAnalysis' COMMENT '报告类型',
-    entity_name         VARCHAR(255)    NOT NULL COMMENT '基金或 Benchmark 名称（A列 Group/Investment）',
-    isin                VARCHAR(20)     NOT NULL DEFAULT '' COMMENT 'ISIN（B列；Benchmark 行置空字符串）',
-    morningstar_rating  VARCHAR(10)     NULL     COMMENT '晨星评级（C列）',
-    fund_size_date      VARCHAR(20)     NULL     COMMENT '规模日期（D列）',
-    fund_size           DECIMAL(30,10)  NULL     COMMENT '规模数值（E列）',
-    period_type         VARCHAR(30)     NOT NULL COMMENT '收益周期（YTD / 1y / 3y / Since Inception 等）',
-    metric              VARCHAR(50)     NOT NULL COMMENT '指标类型：return_cumulative / return_ann',
-    value               DECIMAL(20,10)  NULL     COMMENT '收益率值',
-    peer_group_rank     INT             NULL     COMMENT '同类排名',
-    peer_group_quartile INT             NULL     COMMENT '四分位数',
-    start_date          VARCHAR(20)     NOT NULL COMMENT '周期起始日期',
-    end_date            VARCHAR(20)     NOT NULL COMMENT '周期结束日期',
-    source_row_number   INT             NULL     COMMENT '原始 Excel 行号（溯源）',
-    source_column_name  VARCHAR(255)    NULL     COMMENT '来源列描述（溯源，格式：period_start_end_metric）',
+    report_set          VARCHAR(100)    NOT NULL COMMENT '报表集合名',
+    sheet_name          VARCHAR(100)    NOT NULL COMMENT '来源 Sheet 名',
+    period_type         VARCHAR(100)     NOT NULL COMMENT '周期类型（如 YTD / 1m / 1y / 3y / since_inception）',
+    period_label        VARCHAR(100)     NOT NULL DEFAULT '' COMMENT '周期标签（列名前缀，如 YTD）',
+    start_date          VARCHAR(20)     NOT NULL DEFAULT '' COMMENT '周期开始日期（ISO格式）',
+    end_date            VARCHAR(20)     NOT NULL DEFAULT '' COMMENT '周期结束日期（ISO格式）',
+    metric              VARCHAR(50)     NOT NULL COMMENT '指标类型（如 return_cum / return_ann）',
+    value               DECIMAL(20,10)  NULL     COMMENT '收益值',
+    peer_group_rank     DECIMAL(20,10)  NULL     COMMENT '同类排名',
+    peer_group_quartile DECIMAL(20,10)  NULL     COMMENT '四分位数',
+    source_row_number   INT             NULL     COMMENT '数据来源行号（溯源用）',
+    source_column_name  VARCHAR(200)    NULL     COMMENT '数据来源列名（溯源用）',
+    source_col_number   INT             NULL     COMMENT '数据来源列号（排序/溯源用）',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
                         ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
     PRIMARY KEY (perf_id),
-    UNIQUE KEY uq_lc_report_fa_perf (report_id, meta_id, entity_name, isin, metric, period_type, start_date, end_date),
-    KEY idx_lc_report_fa_perf_meta (meta_id),
     KEY idx_lc_report_fa_perf_report (report_id),
-    KEY idx_lc_report_fa_perf_entity (entity_name(64))
+    KEY idx_lc_report_fa_perf_entity (entity_id),
+    KEY idx_lc_report_fa_perf_lookup (report_set, sheet_name, period_type, metric)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-  COMMENT='Fund Analysis 基金表现明细，按快照+基金+周期+指标行级存储，不同快照永久共存';
+  COMMENT='FundAnalysis 基金表现与排名明细表，按周期和指标类型行级存储';
   
 
 -- -------------------------------------------------------------
--- A. lc_fund_code_map  基金代码映射表（自动维护，无需手工录入）
---    由 Quartile_weekly ETL 上传时自动维护：
---      loader.py 解析 peer group 名称中的括号（如 "VPAF & CG"）
---      按 peer group 内实体行顺序一一映射 fund_code → entity_name → ISIN
---      inception_date 来自 QW 文件 row 7-8 的 inception 列头（如 VPAF inception 对应 4/2/1993）
---    存储 fund_code（SalesReport B列）→ entity_name（Morningstar长名）→ ISIN → inception_date
+-- A. lc_fund_code_map  基金代码映射表（自动/手工维护）
 -- -------------------------------------------------------------
 CREATE TABLE lc_fund_code_map (
+    -- 基础数据
     fund_code       VARCHAR(50)   NOT NULL COMMENT '基金短代码（来自 SalesReport B列，如 VPHY）',
-    entity_name     VARCHAR(255)  NOT NULL COMMENT 'Morningstar 长名称（对应 lc_report_qw_entity.entity_name）',
-    isin            VARCHAR(20)   NOT NULL DEFAULT '' COMMENT 'ISIN（对应 lc_report_qw_entity.isin）',
-    inception_date  DATE          NULL     COMMENT '基金成立日期（来自 QW 文件 inception 列头 row 8）',
-    benchmark_name  VARCHAR(255)  NULL     COMMENT 'Benchmark显示名称（对应Excel Performance Sheet D列）',
-    bm_entity_name  VARCHAR(255)  NULL     COMMENT 'QW数据中BM的实际entity_name（用于JOIN v_fund_period_returns匹配benchmark收益行）',
+    fund_name       VARCHAR(255)  NULL     COMMENT '基金全称（来自 SalesReport C列）',
+    isin            VARCHAR(20)   NULL     COMMENT 'ISIN（来自 Quartile_weekly 文件解析）',
+    is_fund         TINYINT       NOT NULL DEFAULT 0 COMMENT '标记是否是Fund，默认是0-否',
+    is_new          TINYINT       NOT NULL DEFAULT 0 COMMENT '标记是否新增，默认0',
+    is_diff         TINYINT       NOT NULL DEFAULT 0 COMMENT '0表示无差异，大于0表示有差异：1表示entity_name有差异， 2表示bm_entity_name有差异， 3表示两个都有差异',
+    
+    -- 配置Performance
+    benchmark_name  VARCHAR(255)  NULL     COMMENT 'Benchmark显示名称（对应Excel Performance Sheet D列，手工维护）',
+    inception_date  DATE          NULL     COMMENT '基金成立日期（来自 QW 文件 inception 列头 row 8，用于Performance收益计算，手工维护）',
+    
+    -- 配置Morningstar AUM
+    entity_name     VARCHAR(255)  NULL     COMMENT 'Morningstar 长名称（对应 Morningstar AUM 中 MS_VP Open End Fund 分组的 entity_name）',
+    bm_entity_name  VARCHAR(255)  NULL     COMMENT 'QW数据中BM的实际entity_name（对应 Morningstar AUM 中 BM 分组的 entity_name，用于JOIN匹配benchmark收益行，手工维护）',
+    
     created_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (fund_code),
     KEY idx_entity_name (entity_name(64))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
-  COMMENT='fund_code(短) <-> entity_name(Morningstar长名) 自动映射表，由 Quartile_weekly ETL 上传时从 peer group 名称提取';
+  COMMENT='fund_code(短) <-> 各维度自动映射表';
 
 
 -- -------------------------------------------------------------

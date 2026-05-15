@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
+import calendar
 from pathlib import Path
 from typing import Any, Dict
 
@@ -31,15 +32,29 @@ def _load_mapping_rules() -> Dict[str, Any]:
     return json.loads(rules_path.read_text(encoding="utf-8"))
 
 
+def _parse_date(date_str: str) -> str:
+    try:
+        return datetime.strptime(date_str, "%m/%d/%Y").date().isoformat()
+    except ValueError:
+        pass
+    try:
+        # 针对 MM/YYYY 格式，按该月最后一天处理
+        dt = datetime.strptime(date_str, "%m/%Y")
+        _, last_day = calendar.monthrange(dt.year, dt.month)
+        return dt.replace(day=last_day).date().isoformat()
+    except ValueError:
+        raise ValueError(f"Unknown date format: {date_str}")
+
+
 def _extract_dates(column_name: str, date_pattern: str) -> tuple[str | None, str | None]:
     """从列名中提取最多两个日期（start_date, end_date）"""
     matches = re.findall(date_pattern, column_name)
     if len(matches) >= 2:
-        start = datetime.strptime(matches[-2], "%m/%d/%Y").date().isoformat()
-        end = datetime.strptime(matches[-1], "%m/%d/%Y").date().isoformat()
+        start = _parse_date(matches[-2])
+        end = _parse_date(matches[-1])
         return start, end
     if len(matches) == 1:
-        one = datetime.strptime(matches[0], "%m/%d/%Y").date().isoformat()
+        one = _parse_date(matches[0])
         return one, one
     return None, None
 
@@ -102,6 +117,14 @@ def map_column(column_name: str, rules: Dict[str, Any] | None = None) -> ColumnM
         start_date, end_date = _extract_dates(column_name, rules["date_pattern"])
     except ValueError:
         start_date, end_date = None, None
+
+    if period_label and start_date and end_date:
+        if period_type is None:
+            period_type = period_label
+        if value_role is None and metric_kind is None:
+            parts = column_name.split("_")
+            metric_kind = parts[-1].strip() if parts else "Unknown Metric"
+            value_role = "value"
 
     return ColumnMapping(
         source_column=column_name,

@@ -428,12 +428,14 @@ def api_get_parsed_data(
                 "daily_gross_sub_usd_k", "daily_gross_red_usd_k", "daily_net_flow_usd_k",
                 "mtd_gross_sub_usd_k", "mtd_gross_red_usd_k", "mtd_net_flow_usd_k",
                 "ytd_gross_sub_usd_k", "ytd_gross_red_usd_k", "ytd_net_flow_usd_k"]
-    elif report_type == "Quartile_weekly":
+    elif report_type in ("Quartile_weekly", "FundAnalysis"):
+        prefix = "qw" if report_type == "Quartile_weekly" else "fa"
+        prefix = "qw" if report_type == "Quartile_weekly" else "fa"
         # ── Step 1: 获取该报告下所有 sheet 的元数据（按 sheet_name 排序）──
         meta_rows = db.execute(
-            text("""
+            text(f"""
                 SELECT meta_id, sheet_name, currency, grouped_by, calculated_on, exported_on, report_name
-                FROM lc_report_qw_meta
+                FROM lc_report_{prefix}_meta
                 WHERE report_id = :rid
                 ORDER BY meta_id
             """),
@@ -456,13 +458,13 @@ def api_get_parsed_data(
 
             # ── Step 2a: 拉取该 sheet 下所有实体（保持原始行顺序）──────────
             entity_rows = db.execute(
-                text("""
+                text(f"""
                     SELECT entity_id, entity_name, entity_type,
                            isin, strategy_group,
                            morningstar_rating, morningstar_category,
                            benchmark, currency AS entity_currency,
                            source_row_number
-                    FROM lc_report_qw_entity
+                    FROM lc_report_{prefix}_entity
                     WHERE report_id = :rid AND sheet_name = :sn
                     ORDER BY source_row_number
                 """),
@@ -483,171 +485,225 @@ def api_get_parsed_data(
 
             entity_ids = [r[0] for r in entity_rows]
 
-            # ── Step 2b: 按 source_row_number 最小值确定 period 列顺序 ─────────
-            period_col_keys = []
+            # ── Step 2b & 2c: 获取 period & size 元数据并按 source_col_number 排序 ─────────
             period_order_rows = db.execute(
-                text("""
+                text(f"""
                     SELECT period_type, period_label, start_date, end_date, metric,
-                           MIN(source_row_number) AS min_row
-                    FROM lc_report_qw_performance
+                           MIN(source_col_number) AS min_col,
+                           COUNT(peer_group_rank) AS has_rank,
+                           COUNT(peer_group_quartile) AS has_quartile
+                    FROM lc_report_{prefix}_performance
                     WHERE report_id = :rid AND sheet_name = :sn
                     GROUP BY period_type, period_label, start_date, end_date, metric
-                    ORDER BY min_row, period_type, metric
                 """),
                 {"rid": report_id, "sn": sheet_name}
             ).fetchall()
 
-            # Two-pass build:
-            #   Pass 1 — group period_order_rows by (period_label, start_date, end_date)
-            #            to find all metrics per date-group, preserving encounter order.
-            #   Pass 2 — emit columns:  [metric1_value, metric2_value, ..., rank, quartile]
-            #            rank/quartile appear only ONCE per (period_label, start_date, end_date).
-            pg_info_map: dict = {}   # (period_label, start_date, end_date) -> {period_type, metrics[]}
+            pg_info_map: dict = {}
             for pr in period_order_rows:
-                pg_key = (pr[1], pr[2], pr[3])   # (period_label, start_date, end_date)
+                pg_key = (pr[1], pr[2], pr[3])
+                m_col = pr[5] if pr[5] is not None else 999999
+                has_rank = pr[6] > 0
+                has_quartile = pr[7] > 0
+                
                 if pg_key not in pg_info_map:
-                    pg_info_map[pg_key] = {"period_type": pr[0], "metrics": []}
+                    pg_info_map[pg_key] = {
+                        "period_type": pr[0], 
+                        "metrics": [], 
+                        "min_col": m_col,
+                        "has_rank": has_rank,
+                        "has_quartile": has_quartile
+                    }
+                else:
+                    if m_col < pg_info_map[pg_key]["min_col"]:
+                        pg_info_map[pg_key]["min_col"] = m_col
+                    if has_rank:
+                        pg_info_map[pg_key]["has_rank"] = True
+                    if has_quartile:
+                        pg_info_map[pg_key]["has_quartile"] = True
+                
                 if pr[4] not in pg_info_map[pg_key]["metrics"]:
                     pg_info_map[pg_key]["metrics"].append(pr[4])
 
-            # 按当前 sheet 的固定列顺序排序
-            sorted_pg_items = sorted(pg_info_map.items(), key=lambda kv: _period_sort_key(kv[0], sheet_name))
-
-            for pg_key, pg_info in sorted_pg_items:
-                period_label, start_date, end_date = pg_key
-                first_metric = pg_info["metrics"][0]
-                # 每个 metric 生成一个 value 列
-                for metric in pg_info["metrics"]:
-                    period_col_keys.append({
-                        "period_type":  pg_info["period_type"],
-                        "period_label": period_label,
-                        "start_date":   start_date,
-                        "end_date":     end_date,
-                        "metric":       metric,
-                        "sub":          "value",
-                        "header": _perf_col_header(period_label, start_date, end_date, metric, "value"),
-                    })
-                # rank / quartile 共用第一个 metric 的数据（DB 中冗余存储，值相同）
-                for sub in ("rank", "quartile"):
-                    period_col_keys.append({
-                        "period_type":  pg_info["period_type"],
-                        "period_label": period_label,
-                        "start_date":   start_date,
-                        "end_date":     end_date,
-                        "metric":       first_metric,   # 用第一个 metric 做索引
-                        "sub":          sub,
-                        "header": _perf_col_header(period_label, start_date, end_date, first_metric, sub),
-                    })
-
-            # ── Step 2c: 拉取该 sheet 规模快照的日期维度 ─────────────────────
             size_cols = db.execute(
-                text("""
-                    SELECT DISTINCT ss.size_type, ss.snapshot_date, ss.source_column_name
-                    FROM lc_report_qw_size_snapshot ss
-                    JOIN lc_report_qw_entity e ON e.entity_id = ss.entity_id
+                text(f"""
+                    SELECT ss.size_type, ss.snapshot_date, ss.source_column_name, MIN(ss.source_col_number) AS min_col
+                    FROM lc_report_{prefix}_size_snapshot ss
+                    JOIN lc_report_{prefix}_entity e ON e.entity_id = ss.entity_id
                     WHERE ss.report_id = :rid AND e.sheet_name = :sn
-                    ORDER BY ss.size_type, ss.snapshot_date
+                    GROUP BY ss.size_type, ss.snapshot_date, ss.source_column_name
                 """),
                 {"rid": report_id, "sn": sheet_name}
             ).fetchall()
 
-            size_col_keys = []
+            size_info_list = []
             seen_size_keys = set()
             for sc in size_cols:
                 k = (sc[0], sc[1])
                 if k not in seen_size_keys:
                     seen_size_keys.add(k)
                     label = sc[2] or f"{sc[0]} {sc[1]}"
-                    size_col_keys.append({"size_type": sc[0], "snapshot_date": sc[1], "header": label})
+                    m_col = sc[3] if sc[3] is not None else 999999
+                    size_info_list.append({
+                        "size_type": sc[0],
+                        "snapshot_date": sc[1],
+                        "header": label,
+                        "min_col": m_col
+                    })
 
-            # ── Step 2d: 拉取该 sheet 所有 performance 数据，构建 entity_id 索引 ──
+            dynamic_blocks = []
+            for pg_key, pg_info in pg_info_map.items():
+                dynamic_blocks.append({
+                    "type": "period",
+                    "key": pg_key,
+                    "info": pg_info,
+                    "min_col": pg_info["min_col"]
+                })
+            for sz_info in size_info_list:
+                dynamic_blocks.append({
+                    "type": "size",
+                    "info": sz_info,
+                    "min_col": sz_info["min_col"]
+                })
+            
+            dynamic_blocks.sort(key=lambda x: x["min_col"])
+
+            # ── Step 2d & 2e: 拉取全量明细数据，构建内存索引 ──────────────────
             perf_all = db.execute(
-                text("""
+                text(f"""
                     SELECT entity_id, period_label, start_date, end_date, metric,
                            value, peer_group_rank, peer_group_quartile
-                    FROM lc_report_qw_performance
+                    FROM lc_report_{prefix}_performance
                     WHERE report_id = :rid AND sheet_name = :sn
                 """),
                 {"rid": report_id, "sn": sheet_name}
             ).fetchall()
 
-            # perf_index[(entity_id, period_label, start_date, end_date, metric)]
-            #   = (value, rank, quartile)
             perf_index = {}
             for pr in perf_all:
-                k = (pr[0], pr[1], pr[2], pr[3], pr[4])
-                perf_index[k] = (pr[5], pr[6], pr[7])
+                perf_index[(pr[0], pr[1], pr[2], pr[3], pr[4])] = (pr[5], pr[6], pr[7])
 
-            # ── Step 2e: 拉取规模快照数据 ────────────────────────────────────
             size_all = db.execute(
-                text("""
+                text(f"""
                     SELECT ss.entity_id, ss.size_type, ss.snapshot_date, ss.snapshot_value
-                    FROM lc_report_qw_size_snapshot ss
-                    JOIN lc_report_qw_entity e ON e.entity_id = ss.entity_id
+                    FROM lc_report_{prefix}_size_snapshot ss
+                    JOIN lc_report_{prefix}_entity e ON e.entity_id = ss.entity_id
                     WHERE ss.report_id = :rid AND e.sheet_name = :sn
                 """),
                 {"rid": report_id, "sn": sheet_name}
             ).fetchall()
 
-            size_index = {}  # (entity_id, size_type, snapshot_date) -> value
+            size_index = {}
             for sr in size_all:
                 size_index[(sr[0], sr[1], sr[2])] = sr[3]
 
             # ── Step 2f: 构建列头 ──────────────────────────────────────────
-            static_cols = [
-                "Group/Investment", "Morningstar Rating Overall", "ISIN",
-                "Morningstar Category", "Calculation Benchmark",
-            ]
-            size_headers   = [sc["header"] for sc in size_col_keys]
-            period_headers = [pc["header"] for pc in period_col_keys]
-            all_headers = static_cols + size_headers + period_headers
+            has_ms_rating = any(er[5] and str(er[5]).strip() for er in entity_rows)
+            has_isin = any(er[3] and str(er[3]).strip() for er in entity_rows)
+            has_ms_category = any(er[6] and str(er[6]).strip() for er in entity_rows)
+            has_benchmark = any(er[7] and str(er[7]).strip() for er in entity_rows)
 
-            # ── Step 2f-2: 构建合并表头分组描述（用于前端 3 行合并表头）──────
+            static_cols = ["Group/Investment"]
+            if has_ms_rating:
+                static_cols.append("Morningstar Rating Overall")
+            if has_isin:
+                static_cols.append("ISIN")
+            if has_ms_category:
+                static_cols.append("Morningstar Category")
+            if has_benchmark:
+                static_cols.append("Calculation Benchmark")
+            
+            all_headers = static_cols.copy()
+            column_groups = []
+            for ci, col in enumerate(static_cols):
+                column_groups.append({"type": "static", "label": col, "col_index": ci})
+
             _METRIC_LABEL = {
                 "return_cum":        "Return (Cumulative)",
                 "return_ann":        "Return (Annualized)",
                 "return_cumulative": "Return (Cumulative)",
                 "return_annualized": "Return (Annualized)",
+                "std_dev_ann":       "Std Dev (Annualized)",
             }
-            column_groups = []
-            # 静态列：占 3 行高度
-            for ci, col in enumerate(static_cols):
-                column_groups.append({"type": "static", "label": col, "col_index": ci})
-            # 规模列：占 3 行高度
-            for si, sc in enumerate(size_col_keys):
-                column_groups.append({"type": "size", "label": sc["header"],
-                                      "col_index": len(static_cols) + si})
-            # Period 列组：按 (period_label, start_date, end_date) 聚合
-            # 同一 period 可能有多个 metric（如 return_cum + return_ann），
-            # 不能按固定步长 3 切割，必须按日期维度聚合成同一组
-            period_base = len(static_cols) + len(size_col_keys)
-            pg_map: dict = {}   # ordered dict, key=(period_label, start_date, end_date)
-            for ci_off, pc in enumerate(period_col_keys):
-                pg_key = (pc["period_label"], pc["start_date"], pc["end_date"])
-                abs_col = period_base + ci_off
-                if pg_key not in pg_map:
+
+            dynamic_col_keys = []
+            current_col_index = len(static_cols)
+
+            for blk in dynamic_blocks:
+                if blk["type"] == "size":
+                    sz = blk["info"]
+                    dynamic_col_keys.append({
+                        "type": "size",
+                        "size_type": sz["size_type"],
+                        "snapshot_date": sz["snapshot_date"],
+                        "header": sz["header"]
+                    })
+                    all_headers.append(sz["header"])
+                    column_groups.append({
+                        "type": "size",
+                        "label": sz["header"],
+                        "col_index": current_col_index
+                    })
+                    current_col_index += 1
+                else:
+                    pg_key = blk["key"]
+                    pg_info = blk["info"]
+                    period_label, start_date, end_date = pg_key
+                    first_metric = pg_info["metrics"][0]
+                    
+                    sub_cols = []
+                    
+                    for metric in pg_info["metrics"]:
+                        header = _perf_col_header(period_label, start_date, end_date, metric, "value")
+                        dynamic_col_keys.append({
+                            "type": "period",
+                            "period_label": period_label,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "metric": metric,
+                            "sub": "value",
+                            "header": header
+                        })
+                        all_headers.append(header)
+                        metric_lbl = _METRIC_LABEL.get(metric, metric or "Return")
+                        sub_cols.append({"label": metric_lbl, "col_index": current_col_index})
+                        current_col_index += 1
+                        
+                    for sub in ("rank", "quartile"):
+                        if sub == "rank" and not pg_info.get("has_rank"):
+                            continue
+                        if sub == "quartile" and not pg_info.get("has_quartile"):
+                            continue
+
+                        header = _perf_col_header(period_label, start_date, end_date, first_metric, sub)
+                        dynamic_col_keys.append({
+                            "type": "period",
+                            "period_label": period_label,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "metric": first_metric,
+                            "sub": sub,
+                            "header": header
+                        })
+                        all_headers.append(header)
+                        lbl = "Peer group rank" if sub == "rank" else "Peer group quartile"
+                        sub_cols.append({"label": lbl, "col_index": current_col_index})
+                        current_col_index += 1
+                    
                     dr = ""
-                    if pc["start_date"] and pc["end_date"]:
-                        dr = f"{pc['start_date']}~{pc['end_date']}"
-                    elif pc["end_date"]:
-                        dr = pc["end_date"]
-                    pg_map[pg_key] = {
-                        "type":         "period",
-                        "period_label": pc["period_label"],
-                        "date_range":   dr,
-                        "col_start":    abs_col,
-                        "sub_cols":     [],
-                    }
-                metric_lbl = _METRIC_LABEL.get(pc["metric"], pc["metric"] or "Return")
-                lbl = (metric_lbl       if pc["sub"] == "value"
-                       else "Peer group rank"     if pc["sub"] == "rank"
-                       else "Peer group quartile")
-                pg_map[pg_key]["sub_cols"].append({"label": lbl, "col_index": abs_col})
-
-            for grp in pg_map.values():
-                grp["col_count"] = len(grp["sub_cols"])
-                column_groups.append(grp)
-
+                    if start_date and end_date:
+                        dr = f"{start_date}~{end_date}"
+                    elif end_date:
+                        dr = end_date
+                    
+                    column_groups.append({
+                        "type": "period",
+                        "period_label": period_label,
+                        "date_range": dr,
+                        "col_start": sub_cols[0]["col_index"],
+                        "col_count": len(sub_cols),
+                        "sub_cols": sub_cols
+                    })
 
             # ── Step 2g: 逐行组装数据 ────────────────────────────────────────
             rows_out = []
@@ -680,28 +736,26 @@ def api_get_parsed_data(
                 }
 
                 # 规模列（原始数值）
-                for sc in size_col_keys:
-                    val = size_index.get((eid, sc["size_type"], sc["snapshot_date"]))
-                    row[sc["header"]] = _raw(val)
-
-                # Performance 列：每个 period 拆为 3 列（value / rank / quartile）
-                for pc in period_col_keys:
-                    k = (eid, pc["period_label"], pc["start_date"], pc["end_date"], pc["metric"])
-                    perf = perf_index.get(k)
-                    if perf:
-                        val, rank, quartile = perf
-                        sub = pc["sub"]
-                        if sub == 'value':
-                            row[pc["header"]] = _raw(val)
-                        elif sub == 'rank':
-                            row[pc["header"]] = _raw(rank)
-                        else:
-                            row[pc["header"]] = _raw(quartile)
+                for dk in dynamic_col_keys:
+                    if dk["type"] == "size":
+                        val = size_index.get((eid, dk["size_type"], dk["snapshot_date"]))
+                        row[dk["header"]] = _raw(val)
                     else:
-                        row[pc["header"]] = ""
+                        k = (eid, dk["period_label"], dk["start_date"], dk["end_date"], dk["metric"])
+                        perf = perf_index.get(k)
+                        if perf:
+                            val, rank, quartile = perf
+                            sub = dk["sub"]
+                            if sub == 'value':
+                                row[dk["header"]] = _raw(val)
+                            elif sub == 'rank':
+                                row[dk["header"]] = _raw(rank)
+                            else:
+                                row[dk["header"]] = _raw(quartile)
+                        else:
+                            row[dk["header"]] = ""
 
                 rows_out.append(row)
-
             sheets_result.append({
                 "sheet_name": sheet_name,
                 "meta": {
@@ -713,149 +767,6 @@ def api_get_parsed_data(
                 "columns": all_headers,
                 "column_groups": column_groups,
                 "rows": rows_out,
-            })
-
-        return {"success": True, "report_type": report_type, "sheets": sheets_result}
-
-    elif report_type == "FundAnalysis":
-        # ── Step 1: 获取所有快照元数据，按 sheet_name 分组 ───────────────
-        meta_rows = db.execute(
-            text("""
-                SELECT meta_id, sheet_name, snapshot_type, snapshot_date,
-                       calculated_on, currency, grouped_by
-                FROM lc_report_fa_meta
-                WHERE report_id = :rid
-                ORDER BY sheet_name, snapshot_type
-            """),
-            {"rid": report_id}
-        ).fetchall()
-
-        if not meta_rows:
-            return {"success": True, "report_type": report_type, "sheets": []}
-
-        # sheet_name -> {"t0": {...}, "t1": {...}}
-        sheet_meta: dict = {}
-        for mr in meta_rows:
-            sn, st = mr[1], mr[2]
-            if sn not in sheet_meta:
-                sheet_meta[sn] = {}
-            sheet_meta[sn][st] = {
-                "meta_id":       mr[0],
-                "snapshot_date": mr[3],
-                "calculated_on": mr[4],
-                "currency":      mr[5] or "",
-                "grouped_by":    mr[6] or "",
-            }
-
-        sheets_result = []
-
-        for sheet_name, snapshots in sheet_meta.items():
-            t0 = snapshots.get("t0")
-            t1 = snapshots.get("t1")
-            if not t0:
-                continue
-
-            # ── Step 2: 拉取 t0 全量 performance ─────────────────────────
-            perf_t0_rows = db.execute(
-                text("""
-                    SELECT entity_name, isin, morningstar_rating,
-                           fund_size_date, fund_size,
-                           period_type, metric, value,
-                           peer_group_rank, peer_group_quartile,
-                           start_date, end_date, source_row_number
-                    FROM lc_report_fa_performance
-                    WHERE meta_id = :mid
-                    ORDER BY source_row_number, period_type, metric
-                """),
-                {"mid": t0["meta_id"]}
-            ).fetchall()
-
-            # ── Step 3: 拉取 t1 performance，建索引 ─────────────────────
-            perf_t1_idx: dict = {}
-            if t1:
-                for r in db.execute(
-                    text("""
-                        SELECT entity_name, period_type, metric,
-                               value, peer_group_rank, peer_group_quartile
-                        FROM lc_report_fa_performance
-                        WHERE meta_id = :mid
-                    """),
-                    {"mid": t1["meta_id"]}
-                ).fetchall():
-                    perf_t1_idx[(r[0], r[1], r[2])] = {
-                        "value":    _raw(r[3]),
-                        "rank":     r[4],
-                        "quartile": r[5],
-                    }
-
-            # ── Step 4: 构建 entity 字典 ──────────────────────────────────
-            entities: dict = {}
-            entity_order: list = []
-            period_type_order: list = []
-            seen_pt: set = set()
-
-            for r in perf_t0_rows:
-                ename = r[0]
-                if ename not in entities:
-                    entities[ename] = {
-                        "entity_name":        ename,
-                        "isin":               r[1] or "",
-                        "morningstar_rating": r[2] or "",
-                        "fund_size_date":     r[3] or "",
-                        "fund_size":          _raw(r[4]),
-                        "periods":            {},
-                    }
-                    entity_order.append(ename)
-
-                pt, metric = r[5], r[6]
-                if pt not in seen_pt:
-                    seen_pt.add(pt)
-                    period_type_order.append(pt)
-
-                if pt not in entities[ename]["periods"]:
-                    entities[ename]["periods"][pt] = {
-                        "start_date":  r[10],
-                        "end_date":    r[11],
-                        "t0": {},
-                        "t1": {},
-                        "rank_change": None,
-                    }
-
-                entities[ename]["periods"][pt]["t0"][metric] = {
-                    "value":    _raw(r[7]),
-                    "rank":     r[8],
-                    "quartile": r[9],
-                }
-
-                t1_data = perf_t1_idx.get((ename, pt, metric))
-                if t1_data:
-                    entities[ename]["periods"][pt]["t1"][metric] = t1_data
-                    # rank 数字越小越好（排名越靠前 = Better）
-                    r0, r1 = r[8], t1_data.get("rank")
-                    if r0 is not None and r1 is not None and \
-                            entities[ename]["periods"][pt]["rank_change"] is None:
-                        if r0 < r1:
-                            entities[ename]["periods"][pt]["rank_change"] = "Better"
-                        elif r0 > r1:
-                            entities[ename]["periods"][pt]["rank_change"] = "Worse"
-                        else:
-                            entities[ename]["periods"][pt]["rank_change"] = "Same"
-                else:
-                    # 上期无对应数据：默认 value=0, rank=0, quartile=0, rank_change=Worse
-                    entities[ename]["periods"][pt]["t1"][metric] = {
-                        "value":    0,
-                        "rank":     0,
-                        "quartile": 0,
-                    }
-                    if entities[ename]["periods"][pt]["rank_change"] is None:
-                        entities[ename]["periods"][pt]["rank_change"] = "Worse"
-
-            sheets_result.append({
-                "sheet_name":   sheet_name,
-                "meta_t0":      t0,
-                "meta_t1":      t1,
-                "period_types": period_type_order,
-                "rows":         [entities[n] for n in entity_order],
             })
 
         return {"success": True, "report_type": report_type, "sheets": sheets_result}
@@ -891,3 +802,155 @@ def api_check_file(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/reports/{report_id}/fa-compare", summary="获取 Fund Analysis 对比数据")
+def api_get_fa_compare_data(
+    report_id: int,
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import text
+
+    row_t0 = db.execute(
+        text("SELECT report_date FROM lc_report WHERE report_id = :rid AND status != 'DELETED'"),
+        {"rid": report_id}
+    ).fetchone()
+    if not row_t0:
+        raise HTTPException(status_code=404, detail="Current report not found")
+    t0_date = row_t0[0]
+
+    row_t1 = db.execute(
+        text("SELECT report_id, report_date FROM lc_report WHERE report_date < :rd AND status != 'DELETED' ORDER BY report_date DESC LIMIT 1"),
+        {"rd": t0_date}
+    ).fetchone()
+    t1_report_id = row_t1[0] if row_t1 else None
+
+    target_sheets = ["PG_VPHY_D (HKSFC)", "PG_VPHY_D (offshore)"]
+    target_periods = ["1y", "YTD"]
+
+    sheets_result = []
+    
+    for sheet_name in target_sheets:
+        meta_t0 = db.execute(
+            text("SELECT calculated_on, currency FROM lc_report_fa_meta WHERE report_id = :rid AND sheet_name = :sn"),
+            {"rid": report_id, "sn": sheet_name}
+        ).fetchone()
+        
+        if not meta_t0:
+            continue
+            
+        sheet_data = {
+            "sheet_name": sheet_name,
+            "meta_t0": {"snapshot_date": str(meta_t0[0]) if meta_t0[0] else "", "currency": meta_t0[1] or ""},
+            "meta_t1": None,
+            "period_types": target_periods,
+            "rows": []
+        }
+
+        if t1_report_id:
+            meta_t1 = db.execute(
+                text("SELECT calculated_on, currency FROM lc_report_fa_meta WHERE report_id = :rid AND sheet_name = :sn"),
+                {"rid": t1_report_id, "sn": sheet_name}
+            ).fetchone()
+            if meta_t1:
+                sheet_data["meta_t1"] = {"snapshot_date": str(meta_t1[0]) if meta_t1[0] else "", "currency": meta_t1[1] or ""}
+
+        # T0 Performance
+        perf_t0_rows = db.execute(
+            text("""
+                SELECT e.entity_name, e.isin, e.morningstar_rating,
+                       MAX(sd.snapshot_value) AS fund_size_date,
+                       MAX(s.snapshot_value) AS fund_size,
+                       p.period_label, p.metric, p.value,
+                       p.peer_group_rank, p.peer_group_quartile,
+                       p.start_date, p.end_date, e.source_row_number
+                FROM lc_report_fa_performance p
+                JOIN lc_report_fa_entity e ON p.entity_id = e.entity_id
+                LEFT JOIN lc_report_fa_size_snapshot s ON e.entity_id = s.entity_id AND s.size_type = 'daily'
+                LEFT JOIN lc_report_fa_size_snapshot sd ON e.entity_id = sd.entity_id AND sd.size_type = 'daily_date'
+                WHERE e.report_id = :rid AND e.sheet_name = :sn AND p.period_label IN :periods
+                GROUP BY e.entity_name, e.isin, e.morningstar_rating,
+                         p.period_label, p.metric, p.value,
+                         p.peer_group_rank, p.peer_group_quartile,
+                         p.start_date, p.end_date, e.source_row_number
+                ORDER BY e.source_row_number, p.period_label, p.metric
+            """),
+            {"rid": report_id, "sn": sheet_name, "periods": tuple(target_periods)}
+        ).fetchall()
+
+        # T1 Performance
+        perf_t1_idx: dict = {}
+        if t1_report_id:
+            for r in db.execute(
+                text("""
+                    SELECT e.entity_name, p.period_label, p.metric,
+                           p.value, p.peer_group_rank, p.peer_group_quartile
+                    FROM lc_report_fa_performance p
+                    JOIN lc_report_fa_entity e ON p.entity_id = e.entity_id
+                    WHERE e.report_id = :rid AND e.sheet_name = :sn AND p.period_label IN :periods
+                """),
+                {"rid": t1_report_id, "sn": sheet_name, "periods": tuple(target_periods)}
+            ).fetchall():
+                perf_t1_idx[(r[0], r[1], r[2])] = {
+                    "value": float(r[3]) if r[3] is not None else None,
+                    "rank": r[4],
+                    "quartile": r[5]
+                }
+
+        entities: dict = {}
+        entity_order: list = []
+
+        for r in perf_t0_rows:
+            ename = r[0]
+            if ename not in entities:
+                entities[ename] = {
+                    "entity_name":        ename,
+                    "isin":               r[1] or "",
+                    "morningstar_rating": r[2] or "",
+                    "fund_size_date":     r[3] or "",
+                    "fund_size":          float(r[4]) if r[4] is not None else None,
+                    "periods":            {},
+                }
+                entity_order.append(ename)
+
+            pt, metric = r[5], r[6]
+
+            if pt not in entities[ename]["periods"]:
+                entities[ename]["periods"][pt] = {
+                    "start_date":  r[10],
+                    "end_date":    r[11],
+                    "t0": {},
+                    "t1": {},
+                    "rank_change": None,
+                }
+
+            entities[ename]["periods"][pt]["t0"][metric] = {
+                "value":    float(r[7]) if r[7] is not None else None,
+                "rank":     r[8],
+                "quartile": r[9],
+            }
+
+            t1_data = perf_t1_idx.get((ename, pt, metric))
+            if t1_data:
+                entities[ename]["periods"][pt]["t1"][metric] = t1_data
+                r0, r1 = r[8], t1_data.get("rank")
+                if r0 is not None and r1 is not None and entities[ename]["periods"][pt]["rank_change"] is None:
+                    if r0 < r1:
+                        entities[ename]["periods"][pt]["rank_change"] = "Better"
+                    elif r0 > r1:
+                        entities[ename]["periods"][pt]["rank_change"] = "Worse"
+                    else:
+                        entities[ename]["periods"][pt]["rank_change"] = "Same"
+            else:
+                entities[ename]["periods"][pt]["t1"][metric] = {
+                    "value":    0,
+                    "rank":     0,
+                    "quartile": 0,
+                }
+                if entities[ename]["periods"][pt]["rank_change"] is None:
+                    entities[ename]["periods"][pt]["rank_change"] = "Worse"
+
+        sheet_data["rows"] = [entities[n] for n in entity_order]
+        sheets_result.append(sheet_data)
+
+    return {"success": True, "report_type": "FundAnalysis", "sheets": sheets_result}

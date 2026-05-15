@@ -94,8 +94,12 @@ def archive_overdue_reports(db: Session) -> int:
         """),
         {"cutoff": str(last_friday)},
     )
-    db.commit()
+    
     count = result.rowcount
+    if count > 0:
+        db.execute(text("UPDATE lc_fund_code_map SET is_new=0 WHERE is_new=1"))
+        
+    db.commit()
     if count:
         logger.info(f"[archive] Archived {count} reports (cutoff={last_friday})")
     return count
@@ -254,6 +258,7 @@ def archive_report(db: Session, report_id: int) -> bool:
         text("UPDATE lc_report SET status='ARCHIVED', archived_at=NOW(), updated_at=NOW() WHERE report_id=:rid"),
         {"rid": report_id},
     )
+    db.execute(text("UPDATE lc_fund_code_map SET is_new=0 WHERE is_new=1"))
     db.commit()
     return True
 
@@ -428,7 +433,7 @@ def _trigger_parse_async(
             db.commit()
 
             output_dir = stored_path.parent / f"etl_{file_id}"
-            result = run_pipeline(stored_path, output_dir=output_dir, mode="lenient")
+            result = run_pipeline(stored_path, output_dir=output_dir, mode="lenient", report_type=report_type)
 
             # 提取 inception_date 映射（fund_code → YYYY-MM-DD）
             inception_date_map = extract_qw_inception_dates(stored_path)
@@ -440,6 +445,7 @@ def _trigger_parse_async(
                 report_id=report_id,
                 report_type=report_type,
                 inception_date_map=inception_date_map,
+                column_lineage_by_sheet=result.get("column_lineage_by_sheet"),
             )
 
             parse_summary = {
@@ -655,26 +661,24 @@ def _trigger_fa_parse_async(
 
             # 2. 执行 Pipeline
             output_dir = stored_path.parent / f"etl_fa_{file_id}"
-            result = run_fund_analysis_pipeline(stored_path, output_dir=output_dir)
+            result = run_fund_analysis_pipeline(stored_path, output_dir=output_dir, mode="lenient")
 
             # 3. 执行 Loader
             load_stats = load_fa_to_mysql(
                 db=db,
-                meta_df=result["meta_df"],
-                perf_df=result["perf_df"],
+                parsed_df=result["parsed_df"],
+                meta_records=result["meta_records"],
                 report_id=report_id,
-                report_type=report_type,
-                fund_map_df=result.get("fund_map_df"),  # 自动写入 lc_fund_code_map
+                column_lineage_by_sheet=result.get("column_lineage_by_sheet"),
             )
 
             # 4. 标记为 UNCHECKED + 保存摘要
             parse_summary = {
                 "etl_run_id":       result["etl_run_id"],
-                "report_set":       result["report_set"],
                 "sheet_count":      result["sheet_count"],
-                "meta_rows":        result["meta_rows"],
-                "performance_rows": result["performance_rows"],
-                "fund_map_rows":    result.get("fund_map_rows", 0),
+                "row_count_total":  result["row_count_total"],
+                "quality_errors":   result["quality"]["errors"],
+                "quality_warnings": result["quality"]["warnings"],
                 **load_stats,
             }
             db.execute(

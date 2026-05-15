@@ -292,23 +292,12 @@ onMounted(fetchData)
               <td class="td-num total-val">{{ fmtAum(totalVPRow.aum_usd_mn) }}</td>
               <td colspan="22"></td>
             </tr>
-            <tr v-if="totalVPRow" class="total-row total-vp">
-              <td colspan="2" style="background-color: #fff;"></td>
-              <td colspan="24" class="total-label">Detailed information from <span class="note-link">Y:\Performance Team\Attribution Report\2025\</span></td>
-            </tr>
           </tbody>
         </table>
       </div>
 
       <!-- ── 注脚 ─────────────────────────────────── -->
       <div class="footnotes">
-        <p style="margin-top: 10px;margin-bottom: 10px;">
-          *Note: VAIO Customised Benchmark =85% MSCI AC Asia Information Tech Index + 15% JPM ACI Corp Investment Grade TR
-          <br>
-          *Note: VPMS Benchmark: from inception to 30-Apr-2016 ===&gt; MSCI AC Asia Pacific ex Japan High Dividend Yield Index ; from 1-May-2016 onward ===&gt; MSCI AC Asia ex Japan High Dividend Yield Index
-          <br>
-          *Note: VPAF Benchmark: Hang Seng Price Return Index up to 31 Dec 2004, thereafter it is the Hang Seng Total Return Index to 30-Sep-2017 and MSCI Golden Dragon (incl net return index) starting from 1-Oct-2017 onward
-        </p>
         <!-- ── 可编辑分析师注释区域 ─────────────────────── -->
         <div
           class="analyst-note-block"
@@ -521,7 +510,7 @@ tfoot td {
   font-weight: 700;
   color: #000;
   text-align: left;
-  padding-left: 8px !important;
+  padding-left: 0px !important;
   background: transparent;
 }
 .total-val {
@@ -642,7 +631,7 @@ tfoot td {
 
 /* 富文本渲染区 */
 .analyst-note-content {
-  line-height: 1.6;
+  line-height: 1;
   color: #1e3a5f;
 }
 .analyst-note-content strong { color: #000; }

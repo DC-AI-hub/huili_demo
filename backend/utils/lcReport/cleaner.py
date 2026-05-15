@@ -29,6 +29,8 @@ def standardize_placeholders(df: pd.DataFrame, config: EtlConfig) -> pd.DataFram
 def _is_numeric_target(column_name: str) -> bool:
     """判断列是否应该被强制转为数值类型"""
     lowered = column_name.lower()
+    if "date" in lowered:
+        return False
     keys = ("return", "rank", "quartile", "count", "fund size")
     return any(k in lowered for k in keys)
 

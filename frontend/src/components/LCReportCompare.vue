@@ -62,25 +62,47 @@
         <div class="sheet-header modified">
           <span class="material-symbols-outlined sheet-icon" style="color: #059669;">table_view</span>
           最新修订版 (Modified) - 系统导入后数据
+          <div v-if="report?.reportType === 'FundAnalysis'" class="view-toggle" style="margin-left: 16px;">
+            <button @click="viewMode = 'luckysheet'" :class="{ active: viewMode === 'luckysheet' }">入库数据对比</button>
+            <button @click="viewMode = 'html'" :class="{ active: viewMode === 'html' }">历史同期对比</button>
+          </div>
           <span
             class="badge"
             :class="isCheckedOrVerified ? 'badge-success' : 'badge-warning'"
             style="margin-left: auto;"
           >{{ isCheckedOrVerified ? '已核对' : '待核对' }}</span>
         </div>
-        <div class="sheet-body">
-          <!-- FundAnalysis: 网页渲染组件 -->
-          <LCFundAnalysisView
-            v-if="isFundAnalysis"
-            :sheets="faSheets"
-            style="position:absolute;top:0;left:0;width:100%;height:100%;overflow:auto;"
-          />
-          <!-- 其他报告类型: Luckysheet -->
+        <!-- 右侧加载占位 (luckysheet 模式) -->
+        <div v-if="rightLoading && viewMode === 'luckysheet'" class="sheet-placeholder">
+          <span class="material-symbols-outlined spin">sync</span>
+          <span>正在加载系统数据…</span>
+        </div>
+
+        <!-- 右侧错误提示 (luckysheet 模式) -->
+        <div v-else-if="rightError && viewMode === 'luckysheet'" class="sheet-placeholder error">
+          <span class="material-symbols-outlined">error</span>
+          <span>{{ rightError }}</span>
+        </div>
+
+        <div class="sheet-body" :style="{ visibility: ((rightLoading || rightError) && viewMode === 'luckysheet') ? 'hidden' : 'visible' }">
+          <!-- 系统解析后数据: Luckysheet -->
           <div
-            v-else
+            v-show="viewMode === 'luckysheet'"
             id="luckysheet-right"
             style="margin:0;padding:0;position:absolute;width:100%;height:100%;"
           ></div>
+          <!-- 历史数据: HTML -->
+          <div v-if="viewMode === 'html'" style="width:100%;height:100%;overflow:auto;">
+            <div v-if="faLoading" class="sheet-placeholder">
+              <span class="material-symbols-outlined spin">sync</span>
+              <span>正在加载历史对比数据...</span>
+            </div>
+            <div v-else-if="faError" class="sheet-placeholder error">
+              <span class="material-symbols-outlined">error</span>
+              <span>{{ faError }}</span>
+            </div>
+            <LCFundAnalysisView v-else :sheets="faSheets" />
+          </div>
         </div>
       </div>
     </div>
@@ -109,10 +131,7 @@ const isCheckedOrVerified = computed(() =>
   isVerified.value || (props.report?.items?.[props.itemKey]?.isChecked ?? false)
 )
 
-// ── FundAnalysis 专用状态 ───────────────────────────────
-const faSheets = ref([])
-// 由数据驱动：initRightPanel 检测到 FundAnalysis 后会填充 faSheets
-const isFundAnalysis = computed(() => faSheets.value.length > 0)
+
 
 // ── 左侧状态 ───────────────────────────────────────────
 const leftLoading = ref(true)
@@ -169,6 +188,35 @@ const luckysheetFrameHtml = `<!doctype html>
 </body>
 </html>`
 
+// ── FundAnalysis 历史对比 ─────────────────────────────
+const viewMode = ref('luckysheet')
+const faSheets = ref([])
+const faLoading = ref(false)
+const faError = ref('')
+
+async function fetchFaData() {
+  if (props.report?.reportType !== 'FundAnalysis') return
+  faLoading.value = true
+  faError.value = ''
+  try {
+    const res = await fetch(`${BASE}/reports/${props.report.id}/fa-compare`)
+    if (!res.ok) {
+      faError.value = `加载对比数据失败 (${res.status})`
+      return
+    }
+    const json = await res.json()
+    if (!json.success) {
+      faError.value = json.message || '获取数据失败'
+      return
+    }
+    faSheets.value = json.sheets || []
+  } catch (err) {
+    faError.value = '网络错误: ' + err.message
+  } finally {
+    faLoading.value = false
+  }
+}
+
 // ── 生命周期 ───────────────────────────────────────────
 onMounted(async () => {
   const blob = new Blob([luckysheetFrameHtml], { type: 'text/html' })
@@ -177,6 +225,7 @@ onMounted(async () => {
   // 由于采用了 iframe 物理隔离，左右两边完全不需要再加串行锁了，直接并发飞起！
   initLeftPanel()
   initRightPanel()
+  fetchFaData()
 })
 
 onBeforeUnmount(() => {
@@ -317,21 +366,26 @@ async function initLeftPanel() {
 }
 
 // ── 右侧面板 ───────────────────────────────────────────
+const rightLoading = ref(true)
+const rightError = ref('')
+
 async function initRightPanel() {
   const fileId = props.report?.items[props.itemKey]?.file_id
-  if (!fileId) return
+  if (!fileId) {
+    rightLoading.value = false
+    rightError.value = '未找到文件 ID'
+    return
+  }
+
+  rightLoading.value = true
+  rightError.value = ''
 
   try {
     const res = await fetch(`${BASE}/files/${fileId}/parsed-data`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json = await res.json()
 
-    // ── FundAnalysis: 网页渲染组件，不使用 Luckysheet ────────────────────
-    if (json.report_type === 'FundAnalysis') {
-      faSheets.value = json.sheets || []
-      return
-    }
-
-    // ── Quartile_weekly: 多 Sheet 格式 ──────────────────────────────────
+    // ── Quartile_weekly / FundAnalysis: 多 Sheet 格式 ────────────────────
     if (json.success && json.sheets?.length) {
       const luckySheets = json.sheets.map((sheet, sheetIdx) => {
         const celldata = []
@@ -448,6 +502,7 @@ async function initRightPanel() {
         showsheetbar: luckySheets.length > 1,
         data: luckySheets,
       })
+      rightLoading.value = false
       return
     }
 
@@ -495,8 +550,11 @@ async function initRightPanel() {
         config,
       }]
     })
+    rightLoading.value = false
   } catch (e) {
     console.error('[LCReportCompare] right panel error:', e)
+    rightError.value = '加载系统数据出错: ' + e.message
+    rightLoading.value = false
   }
 }
 
@@ -762,4 +820,31 @@ async function initRightPanel() {
 }
 .badge-warning { background: #fef3c7; color: #b45309; }
 .badge-success { background: #d1fae5; color: #065f46; }
+</style>
+
+<style scoped>
+.view-toggle {
+  display: flex;
+  background: #f1f5f9;
+  border-radius: 6px;
+  padding: 2px;
+}
+.view-toggle button {
+  background: transparent;
+  border: none;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.view-toggle button.active {
+  background: #fff;
+  color: #059669;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+.fa-loading { padding: 20px; color: #64748b; text-align: center; }
+.fa-error { padding: 20px; color: #ef4444; text-align: center; }
 </style>

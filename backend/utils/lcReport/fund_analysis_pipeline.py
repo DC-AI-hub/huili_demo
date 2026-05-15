@@ -1,469 +1,199 @@
 """
-Fund Analysis Excel 解析 Pipeline（迁移自 huili/惠理基金）
-
-数据流：
-  Fund Analysis_*.xlsx → run_fund_analysis_pipeline() → (meta_df, perf_df)
-
-核心特点：
-  · 同一 Sheet 可有多个历史快照块（多个 "Calculated on:" 行），按顺序标记 t0/t1/t2
-  · 表头固定 4 行：header-3=周期 / header-2=起始日期 / header-1=结束日期 / header=指标
-  · Benchmark 行保留（isin 置空），Peer Group 汇总行跳过
-  · 公式辅助列（Wkly Rtn / Previous Wk Ranking / Better/Worse）跳过
+ETL Pipeline — 从原 huili/惠理基金/src/etl_excel/pipeline.py 迁移并适配
+阶段一：Excel → CSV（内存中的结构化 DataFrame）
+读取每张 Sheet → 解析表头 → 解析数据行 → 清洗 → 校验
 """
 from __future__ import annotations
 
 import json
-import re
 import uuid
-from dataclasses import dataclass
-from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
-from openpyxl import load_workbook
+
+from .cleaner import apply_type_rules, standardize_placeholders, summarize_conversion_errors
+from .config import EtlConfig, PipelineArgs
+from .errors import EtlErrorContext, EtlRuleError
+from .extract import list_sheet_names, read_sheet_rows
+from .header_parser import parse_header
+from .meta_extract import parse_sheet_metadata
+from .row_parser import parse_rows
+from .validator import summarize_issues, validate_sheet
 
 
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-
-CALCULATED_PREFIX = "Calculated on:"
-EXPORTED_PREFIX   = "Exported on:"
-PERIOD_PATTERN    = re.compile(r"^(YTD|\d+[my]|SI|Since Inception|\(inception\))$", re.IGNORECASE)
-SUMMARY_NAMES     = {"peer group average", "peer group count", "peer group median"}
-FORMULA_LABELS    = {"wkly rtn", "previous wk ranking", "better/worse", "same", "better", "worse"}
+def _ensure_output_dir(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# 数据类
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class PeriodMetric:
-    period_type:        str
-    start_date:         str
-    end_date:           str
-    metric:             str
-    value_col_idx:      int
-    rank_col_idx:       Optional[int]
-    quartile_col_idx:   Optional[int]
-    source_column_name: str
+def _drop_unnamed_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    unnamed_cols = [col for col in frame.columns if str(col).startswith("Unnamed_")]
+    if unnamed_cols:
+        frame = frame.drop(columns=unnamed_cols)
+    return frame
 
 
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
+def _parse_single_sheet(
+    input_path: Path, sheet_name: str, config: EtlConfig, etl_run_id: str
+) -> Dict[str, object]:
+    """解析单张 Sheet，返回包含 frame / header / metadata / issues 的结果字典"""
+    rows = read_sheet_rows(input_path, sheet_name)
+    if not rows:
+        raise EtlRuleError(
+            "[E3001] empty worksheet",
+            EtlErrorContext(sheet_name=sheet_name, row_idx=None, col_idx=None, rule_id="sheet_non_empty"),
+        )
 
-def _to_text(value: object) -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    return str(value).strip()
+    header = parse_header(rows, config, sheet_name)
+    data_rows = rows[header.data_start_row_idx:]
+    parsed_rows = parse_rows(
+        data_rows=data_rows,
+        flat_columns=header.flat_columns,
+        sheet_name=sheet_name,
+        start_row_idx=header.data_start_row_idx,
+        config=config,
+    )
+    frame = pd.DataFrame([r.payload for r in parsed_rows])
+    if frame.empty:
+        frame = pd.DataFrame(columns=[*header.flat_columns, "group_category", "row_source_sheet", "row_number"])
 
+    frame = _drop_unnamed_columns(frame)
+    frame = standardize_placeholders(frame, config)
+    frame, conversion_errors = apply_type_rules(frame, config)
+    metadata = parse_sheet_metadata(rows, sheet_name, input_path)
+    frame["report_set"] = metadata["report_set"]
+    frame["etl_run_id"] = etl_run_id
+    issues = validate_sheet(frame, sheet_name, config)
 
-def _to_float(value: object) -> Optional[float]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = _to_text(value).replace(",", "")
-    if text == "":
-        return None
-    if text.startswith("(") and text.endswith(")"):
-        text = "-" + text[1:-1]
-    try:
-        return float(text)
-    except ValueError as exc:
-        raise ValueError(f"[F1006] invalid numeric value: {value!r}") from exc
-
-
-def _to_int(value: object) -> Optional[int]:
-    num = _to_float(value)
-    return None if num is None else int(num)
-
-
-def _to_iso_date(value: object) -> Optional[str]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    text = _to_text(value)
-    if not text:
-        return None
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt).date().isoformat()
-        except ValueError:
-            continue
-    raise ValueError(f"[F1005] invalid date value: {text!r}")
+    return {
+        "sheet_name": sheet_name,
+        "frame": frame,
+        "header": header,
+        "conversion_errors": conversion_errors,
+        "issues": issues,
+        "metadata": metadata,
+    }
 
 
-def _parse_datetime_text(text: str, rule_id: str) -> datetime:
-    """解析 'Calculated on: MM/DD/YYYY HH:MM:SS AM/PM' 等格式"""
-    value = text.split(":", 1)[1].strip() if ":" in text else text.strip()
-    for fmt in ("%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"[{rule_id}] invalid datetime value: {text!r}")
-
-
-def _extract_meta_line(rows: List[List[object]], start_idx: int, end_idx: int, prefix: str) -> str:
-    """在 [start_idx, end_idx) 行范围内找以 prefix 开头的文本"""
-    for row_idx in range(max(0, start_idx), min(end_idx, max(0, start_idx) + 10)):
-        for value in rows[row_idx]:
-            t = _to_text(value)
-            if t.startswith(prefix):
-                return t
-    return ""
-
-
-def _after_prefix(text: str, prefix: str) -> str:
-    if text.startswith(prefix):
-        return text[len(prefix):].strip()
-    return ""
-
-
-def _left_fill(values: List[object]) -> List[object]:
-    """将空单元格填充为左侧最近非空值（处理合并单元格）"""
-    filled: List[object] = []
-    last: object = None
-    for v in values:
-        if _to_text(v) != "":
-            last = v
-        filled.append(last)
-    return filled
-
-
-def _normalize_period(value: object) -> Optional[str]:
-    text = _to_text(value).replace(" ", "")
-    if not text:
-        return None
-    if text.lower() == "sinceinception":
-        return "Since Inception"
-    return text if PERIOD_PATTERN.match(text) else None
-
-
-def _metric_from_header(value: object) -> Optional[str]:
-    text = _to_text(value).replace("\n", " ").lower()
-    if "return" not in text:
-        return None
-    if "cumulative" in text:
-        return "return_cumulative"
-    if "annualized" in text:
-        return "return_ann"
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 核心解析逻辑
-# ---------------------------------------------------------------------------
-
-def _find_calculated_rows(rows: List[List[object]]) -> List[int]:
-    return [
-        i for i, row in enumerate(rows)
-        if any(_to_text(v).startswith(CALCULATED_PREFIX) for v in row)
-    ]
-
-
-def _find_header_row(rows: List[List[object]], start_idx: int, end_idx: int) -> int:
-    for i in range(start_idx, end_idx):
-        first = _to_text(rows[i][0]) if rows[i] else ""
-        if first == "Group/Investment":
-            return i
-    raise ValueError(f"[F1003] Group/Investment header row not found near row {start_idx + 1}")
-
-
-def _build_period_metrics(rows: List[List[object]], header_idx: int) -> List[PeriodMetric]:
-    if header_idx < 3:
-        raise ValueError(f"[F1004] insufficient period header rows before row {header_idx + 1}")
-
-    period_row = _left_fill(rows[header_idx - 3])
-    start_row  = _left_fill(rows[header_idx - 2])
-    end_row    = _left_fill(rows[header_idx - 1])
-    metric_row = rows[header_idx]
-
-    groups: Dict[Tuple[str, str, str], Dict[str, object]] = {}
-    for col_idx, header_value in enumerate(metric_row):
-        header_text  = _to_text(header_value)
-        header_lower = header_text.replace("\n", " ").lower()
-        if header_lower in FORMULA_LABELS:
-            continue
-
-        period_type = _normalize_period(period_row[col_idx] if col_idx < len(period_row) else None)
-        if period_type is None:
-            continue
-
-        start_date = _to_iso_date(start_row[col_idx] if col_idx < len(start_row) else None)
-        end_date   = _to_iso_date(end_row[col_idx]   if col_idx < len(end_row)   else None)
-        if start_date is None or end_date is None:
-            continue
-
-        key = (period_type, start_date, end_date)
-        groups.setdefault(key, {"returns": [], "rank": None, "quartile": None})
-
-        metric = _metric_from_header(header_value)
-        if metric:
-            groups[key]["returns"].append((metric, col_idx, header_text))
-        elif "peer group rank" in header_lower:
-            groups[key]["rank"] = col_idx
-        elif "peer group quartile" in header_lower:
-            groups[key]["quartile"] = col_idx
-
-    metrics: List[PeriodMetric] = []
-    for (period_type, start_date, end_date), payload in groups.items():
-        for metric, col_idx, source_name in payload["returns"]:
-            metrics.append(PeriodMetric(
-                period_type=period_type,
-                start_date=start_date,
-                end_date=end_date,
-                metric=metric,
-                value_col_idx=int(col_idx),
-                rank_col_idx=int(payload["rank"]) if payload["rank"] is not None else None,
-                quartile_col_idx=int(payload["quartile"]) if payload["quartile"] is not None else None,
-                source_column_name=f"{period_type}_{start_date}_{end_date}_{source_name}",
-            ))
-
-    if not metrics:
-        raise ValueError(f"[F1007] no return metric columns found near row {header_idx + 1}")
-    return metrics
-
-
-def _is_data_row(row: List[object]) -> bool:
-    entity_name = _to_text(row[0] if row else "")
-    if not entity_name:
-        return False
-    if entity_name.lower() in SUMMARY_NAMES:
-        return False
-    if entity_name.startswith("Benchmark"):
-        return True  # Benchmark 行保留（与 Quartile_weekly 不同）
-    return _to_text(row[1] if len(row) > 1 else "") != ""
-
-
-def _parse_sheet(
-    rows: List[List[object]],
-    sheet_name: str,
-    input_path: Path,
-    report_set: str,
-    etl_run_id: str,
-) -> Tuple[List[Dict], List[Dict]]:
-    meta_records: List[Dict] = []
-    perf_records: List[Dict] = []
-
-    calculated_rows = _find_calculated_rows(rows)
-    if not calculated_rows:
-        raise ValueError(f"[F1002] no 'Calculated on:' block found in sheet: {sheet_name!r}")
-
-    block_bounds = [*calculated_rows, len(rows)]
-
-    for block_idx, start_idx in enumerate(calculated_rows):
-        end_idx = block_bounds[block_idx + 1]
-
-        calculated_line = _extract_meta_line(rows, start_idx, end_idx, CALCULATED_PREFIX)
-        calculated_on   = _parse_datetime_text(calculated_line, "F1008")
-
-        exported_line = _extract_meta_line(rows, start_idx, end_idx, EXPORTED_PREFIX)
-        exported_on   = _parse_datetime_text(exported_line, "F1009") if exported_line else None
-
-        currency    = _after_prefix(_extract_meta_line(rows, start_idx - 4, end_idx, "Currency:"),    "Currency:")
-        grouped_by  = _after_prefix(_extract_meta_line(rows, start_idx - 4, end_idx, "Grouped by:"),  "Grouped by:")
-        investments = _after_prefix(_extract_meta_line(rows, start_idx, end_idx, "Investments:"),     "Investments:")
-
-        header_idx = _find_header_row(rows, start_idx, end_idx)
-        metrics    = _build_period_metrics(rows, header_idx)
-
-        meta = {
-            "report_set":         report_set,
-            "source_filename":    input_path.name,
-            "sheet_name":         sheet_name,
-            "snapshot_type":      f"t{block_idx}",
-            "snapshot_date":      calculated_on.date().isoformat(),
-            "calculated_on":      calculated_on.isoformat(sep=" "),
-            "calculated_date":    calculated_on.date().isoformat(),
-            "calculated_time":    calculated_on.time().replace(microsecond=0).isoformat(),
-            "exported_on":        exported_on.isoformat(sep=" ") if exported_on else "",
-            "currency":           currency or "US Dollar",
-            "grouped_by":         grouped_by,
-            "investments_filter": investments,
-            "etl_run_id":         etl_run_id,
-        }
-        meta_records.append(meta)
-
-        for row_idx in range(header_idx + 1, end_idx):
-            row = rows[row_idx]
-            if not _is_data_row(row):
-                continue
-            entity_name = _to_text(row[0])
-            isin = "" if entity_name.startswith("Benchmark") else _to_text(row[1] if len(row) > 1 else "")
-
-            for pm in metrics:
-                value = _to_float(row[pm.value_col_idx] if pm.value_col_idx < len(row) else None)
-                if value is None:
-                    continue
-                perf_records.append({
-                    **meta,
-                    "entity_name":         entity_name,
-                    "isin":                isin,
-                    "morningstar_rating":  _to_text(row[2] if len(row) > 2 else ""),
-                    "fund_size_date":      _to_iso_date(row[3] if len(row) > 3 else None) or "",
-                    "fund_size":           _to_float(row[4] if len(row) > 4 else None),
-                    "period_type":         pm.period_type,
-                    "metric":              pm.metric,
-                    "value":               value,
-                    "peer_group_rank":     _to_int(row[pm.rank_col_idx]) if pm.rank_col_idx is not None and pm.rank_col_idx < len(row) else None,
-                    "peer_group_quartile": _to_int(row[pm.quartile_col_idx]) if pm.quartile_col_idx is not None and pm.quartile_col_idx < len(row) else None,
-                    "start_date":          pm.start_date,
-                    "end_date":            pm.end_date,
-                    "source_row_number":   row_idx + 1,
-                    "source_column_name":  pm.source_column_name,
-                })
-
-    return meta_records, perf_records
-
-
-# ---------------------------------------------------------------------------
-# fund_code 映射解析（AUM with monthly return 格式）
-#   特征：header 行中 col B（索引 1）= "Group/Investment"（而非 col A）
-#   格式：fund_row: [fund_code, entity_name, ISIN, ...]
-#         bm_row:   [None,      bm_name,     None, ...]
-#         diff_row: [None,      'Diff',      None, ...]
-# ---------------------------------------------------------------------------
-
-def _parse_fund_code_map_sheets(workbook) -> List[Dict]:
+def extract_qw_inception_dates(input_path: Path) -> Dict[str, Optional[str]]:
     """
-    扫描 workbook 中所有 Sheet，识别 'AUM with monthly return' 格式：
-      - header 行的 col B（索引 1）= 'Group/Investment'
-      - fund 行: col A = fund_code（非空短字符串），col B = entity_name，col C = ISIN
-    返回 [{fund_code, entity_name, isin}, ...] 列表，去重。
+    从 Quartile_weekly 文件的 inception 列头提取 fund_code → inception_date 映射。
+
+    QW 文件的 HKSFC funds 等 sheet 中：
+      Row 7: 'VPAF (inception)', 'VPHY (inception)' ...  (即 fund_code)
+      Row 8: '4/2/1993', '9/3/2002' ...                 (即 inception_date)
+
+    返回示例: {'VPAF': '1993-04-02', 'VPHY': '2002-09-03', ...}
     """
-    records: Dict[str, Dict] = {}  # fund_code → record（自动去重）
+    import openpyxl
+    from datetime import datetime
 
-    for sheet_name in workbook.sheetnames:
-        ws = workbook[sheet_name]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    wb = openpyxl.load_workbook(str(input_path), data_only=True)
+    result: Dict[str, Optional[str]] = {}
 
-        # 找 header 行：col B == 'Group/Investment'
-        header_idx = None
-        for i, row in enumerate(rows):
-            if len(row) > 1 and _to_text(row[1]) == "Group/Investment":
-                header_idx = i
-                break
-        if header_idx is None:
-            continue
-
-        for row in rows[header_idx + 1:]:
-            if not row or len(row) < 3:
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        max_col = ws.max_column
+        for j in range(1, max_col + 1):
+            hdr = ws.cell(7, j).value
+            if not hdr or '(inception)' not in str(hdr):
                 continue
-            fund_code   = _to_text(row[0])
-            entity_name = _to_text(row[1])
-            isin        = _to_text(row[2])
+            fund_code = str(hdr).replace('(inception)', '').strip()
+            if fund_code in result:
+                continue  # 已经从其他 sheet 取到
+            raw_date = ws.cell(8, j).value
+            if raw_date is None:
+                continue
+            if hasattr(raw_date, 'strftime'):
+                result[fund_code] = raw_date.strftime('%Y-%m-%d')
+            else:
+                # 字符串格式，如 '4/2/1993'
+                raw_str = str(raw_date).strip()
+                for fmt in ('%m/%d/%Y', '%Y-%m-%d', '%d/%m/%Y'):
+                    try:
+                        result[fund_code] = datetime.strptime(raw_str, fmt).strftime('%Y-%m-%d')
+                        break
+                    except ValueError:
+                        continue
 
-            # fund 行：col A 非空、col C 有 ISIN（纯字母数字）、不是 'Diff'
-            if (
-                fund_code
-                and entity_name
-                and isin
-                and fund_code.lower() != "diff"
-                and entity_name.lower() not in {"diff", "group/investment"}
-            ):
-                records[fund_code] = {
-                    "fund_code":   fund_code,
-                    "entity_name": entity_name,
-                    "isin":        isin,
-                }
+    wb.close()
+    return result
 
-    return list(records.values())
-
-
-# ---------------------------------------------------------------------------
-# 主入口
-# ---------------------------------------------------------------------------
 
 def run_fund_analysis_pipeline(
     input_path: Path,
-    output_dir: Optional[Path] = None,
+    output_dir: Path | None = None,
+    mode: str = "lenient",
 ) -> Dict[str, object]:
     """
-    解析 Fund Analysis Excel，返回结构化结果字典。
+    主入口：运行完整 ETL Pipeline（FundAnalysis 阶段一）。
+
+    Args:
+        input_path: Excel 文件路径
+        output_dir: 中间产物输出目录（可选，不传则只在内存中处理）
+        mode: "strict"（质量错误时抛出异常）或 "lenient"（继续执行）
+        report_type: 报告类型，若是 Quartile_weekly 则按照 config.qw_target_sheets 过滤 sheet
 
     Returns:
-        {
-            "etl_run_id": str,
-            "report_set": str,
-            "source_filename": str,
-            "meta_df": pd.DataFrame,      ← 供 fund_analysis_loader 使用
-            "perf_df": pd.DataFrame,      ← 供 fund_analysis_loader 使用
-            "sheet_count": int,
-            "meta_rows": int,
-            "performance_rows": int,
-        }
+        包含以下键的结果字典：
+        - etl_run_id: 本次运行的 UUID
+        - parsed_df: 合并后的 DataFrame（所有 Sheet 数据）
+        - meta_records: 元数据字典列表
+        - quality: 质量报告摘要
+        - conversion: 类型转换错误摘要
     """
+    args = PipelineArgs(input_path=input_path, output_dir=output_dir or input_path.parent, mode=mode)
     if not input_path.exists():
-        raise FileNotFoundError(f"[F1001] input file not found: {input_path.as_posix()}")
+        raise FileNotFoundError(f"[E1001] input file not found: {input_path.as_posix()}")
+    if mode not in {"strict", "lenient"}:
+        mode = "lenient"
 
+    config = EtlConfig(strict_mode=(mode == "strict"))
     if output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
+        _ensure_output_dir(output_dir)
     etl_run_id = str(uuid.uuid4())
-    report_set = input_path.stem
 
-    workbook = load_workbook(input_path, read_only=True, data_only=True)
-    all_meta: List[Dict] = []
-    all_perf: List[Dict] = []
-    fund_map_records: List[Dict] = []
+    all_results: List[Dict[str, object]] = []
+    all_sheets = list_sheet_names(input_path)
+    # FundAnalysis 排除一些常见的说明类 sheet，其余都解析
+    target_sheets = [s for s in all_sheets if not s.lower().startswith("readme") and not s.lower().startswith("instruction")]
 
-    try:
-        for sheet_name in workbook.sheetnames:
-            ws = workbook[sheet_name]
-            rows = [list(row) for row in ws.iter_rows(values_only=True)]
-            try:
-                meta_records, perf_records = _parse_sheet(rows, sheet_name, input_path, report_set, etl_run_id)
-                all_meta.extend(meta_records)
-                all_perf.extend(perf_records)
-            except ValueError:
-                # 非 Morningstar AUM 格式的 Sheet 跳过（如 AUM with monthly return）
-                pass
+    for sheet_name in target_sheets:
+        result = _parse_single_sheet(input_path, sheet_name, config, etl_run_id)
+        all_results.append(result)
+        if output_dir:
+            safe_name = sheet_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            result["frame"].to_csv(output_dir / f"parsed_{safe_name}.csv", index=False, encoding="utf-8-sig")
 
-        # 额外扫描 AUM with monthly return 格式，提取 fund_code 映射
-        workbook.close()
-        workbook = load_workbook(input_path, read_only=True, data_only=True)
-        fund_map_records = _parse_fund_code_map_sheets(workbook)
-    finally:
-        workbook.close()
-
-    meta_df     = pd.DataFrame(all_meta)
-    perf_df     = pd.DataFrame(all_perf)
-    fund_map_df = pd.DataFrame(fund_map_records) if fund_map_records else pd.DataFrame(columns=["fund_code","entity_name","isin"])
+    all_frames = [r["frame"] for r in all_results]
+    merged = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
 
     if output_dir:
-        meta_df.to_csv(output_dir / "fund_analysis_meta.csv", index=False, encoding="utf-8-sig")
-        perf_df.to_csv(output_dir / "fund_analysis_performance.csv", index=False, encoding="utf-8-sig")
-        fund_map_df.to_csv(output_dir / "fund_code_map.csv", index=False, encoding="utf-8-sig")
-        summary = {
-            "etl_run_id":       etl_run_id,
-            "report_set":       report_set,
-            "source_filename":  input_path.name,
-            "sheet_count":      int(meta_df["sheet_name"].nunique()) if not meta_df.empty else 0,
-            "meta_rows":        int(len(meta_df)),
-            "performance_rows": int(len(perf_df)),
-            "fund_map_rows":    int(len(fund_map_df)),
-        }
-        (output_dir / "fund_analysis_etl_report.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        merged.to_csv(output_dir / "parsed_all.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame([r["metadata"] | {"etl_run_id": etl_run_id} for r in all_results]).to_csv(
+            output_dir / "report_meta.csv", index=False, encoding="utf-8-sig"
+        )
+
+    all_conversion_errors = [e for result in all_results for e in result["conversion_errors"]]
+    all_issues = [i for result in all_results for i in result["issues"]]
+    quality_summary = summarize_issues(all_issues)
+    conversion_summary = summarize_conversion_errors(all_conversion_errors, config.max_error_samples)
+
+    if config.strict_mode and quality_summary["errors"] > 0:
+        raise RuntimeError(
+            f"[E3002] strict mode failed with {quality_summary['errors']} quality errors"
         )
 
     return {
-        "etl_run_id":       etl_run_id,
-        "report_set":       report_set,
-        "source_filename":  input_path.name,
-        "meta_df":          meta_df,
-        "perf_df":          perf_df,
-        "fund_map_df":      fund_map_df,
-        "sheet_count":      int(meta_df["sheet_name"].nunique()) if not meta_df.empty else 0,
-        "meta_rows":        int(len(meta_df)),
-        "performance_rows": int(len(perf_df)),
-        "fund_map_rows":    int(len(fund_map_df)),
+        "etl_run_id": etl_run_id,
+        "mode": mode,
+        "sheet_count": len(all_results),
+        "row_count_total": int(len(merged)),
+        "parsed_df": merged,
+        "meta_records": [r["metadata"] | {"etl_run_id": etl_run_id} for r in all_results],
+        "quality": quality_summary,
+        "conversion": conversion_summary,
+        "column_lineage_by_sheet": {
+            r["sheet_name"]: r["header"].column_lineage for r in all_results
+        },
     }

@@ -124,6 +124,7 @@ def run_pipeline(
     input_path: Path,
     output_dir: Path | None = None,
     mode: str = "lenient",
+    report_type: str = "Quartile_weekly",
 ) -> Dict[str, object]:
     """
     主入口：运行完整 ETL Pipeline（阶段一）。
@@ -132,6 +133,7 @@ def run_pipeline(
         input_path: Excel 文件路径
         output_dir: 中间产物输出目录（可选，不传则只在内存中处理）
         mode: "strict"（质量错误时抛出异常）或 "lenient"（继续执行）
+        report_type: 报告类型，若是 Quartile_weekly 则按照 config.qw_target_sheets 过滤 sheet
 
     Returns:
         包含以下键的结果字典：

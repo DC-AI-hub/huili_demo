@@ -23,8 +23,12 @@ class HeaderParseResult:
     column_lineage: Dict[str, Dict[str, object]]  # 列溯源信息
 
 
+import pandas as pd
+
 def _normalize_text(value: object) -> str:
     if value is None:
+        return ""
+    if pd.isna(value):
         return ""
     return str(value).replace("\n", " ").strip()
 

@@ -316,3 +316,18 @@ class LcFundPerformanceQuartile(Base):
     created_at          = Column(DateTime, default=datetime.utcnow)
     updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class LcFundCodeMap(Base):
+    __tablename__ = "lc_fund_code_map"
+    fund_code       = Column(String(50), primary_key=True)
+    fund_name       = Column(String(255))
+    isin            = Column(String(20))
+    is_fund         = Column(Integer, nullable=False, default=0)
+    is_new          = Column(Integer, nullable=False, default=0)
+    is_diff         = Column(Integer, nullable=False, default=0)
+    benchmark_name  = Column(String(255))
+    inception_date  = Column(Date)
+    entity_name     = Column(String(255))
+    bm_entity_name  = Column(String(255))
+    created_at      = Column(DateTime, default=datetime.utcnow)
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+

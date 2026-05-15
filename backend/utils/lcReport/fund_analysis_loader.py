@@ -1,291 +1,795 @@
 """
-Fund Analysis MySQL Loader（迁移自 huili/惠理基金）
+MySQL Loader — 适配 MySQL 的幂等入库执行器（优化版）
 
-幂等策略：
-  lc_report_fa_meta:        (source_filename, sheet_name, calculated_on) → SELECT+UPDATE/INSERT
-  lc_report_fa_performance: (meta_id, entity_name, isin, metric, period_type, start_date, end_date)
-                             → SELECT+UPDATE/INSERT（不同快照数据永久共存）
+表名已更新为 lc_report_qw_* 系列：
+  lc_report_qw_meta / lc_report_qw_entity / lc_report_qw_size_snapshot / lc_report_qw_performance
+
+子表关联键：(report_id, report_type) 替代原 file_id
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import re
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+from .column_mapper import map_column
 from .id_gen import gen_id
 
 logger = logging.getLogger(__name__)
 
 
-def _v(value: object) -> Optional[object]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    return value
-
-
-def _to_int(value: object) -> Optional[int]:
-    v = _v(value)
-    if v is None:
-        return None
-    try:
-        return int(float(str(v).strip()))
-    except (ValueError, TypeError):
-        return None
-
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
 
 def _to_float(value: object) -> Optional[float]:
-    v = _v(value)
-    if v is None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text_val = str(value).strip()
+    if text_val == "":
         return None
     try:
-        return float(v)
-    except (ValueError, TypeError):
+        return float(text_val)
+    except ValueError:
         return None
 
 
+def _to_text(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value)
+
+
+def _is_data_row(first_cell: object) -> bool:
+    """判断是否为需要入库的数据行。
+    仅跳过首列为空的行，其余全部入库（基金、Benchmark、Peer Group Average/Count）。
+    原始数据完整保留，后续视图/SQL 按需筛选。
+    """
+    t = str(first_cell).strip() if first_cell is not None else ""
+    return t != ""
+
+
+def _normalize_bm_entity_name(entity_name: str) -> str:
+    """将 VP_PG 表中的 'Benchmark N: XXX' 格式清洗为纯 BM 名称 'XXX'。
+    例：'Benchmark 1: HSI HKD TR + MSCI G. Dragon (20171001)'
+      → 'HSI HKD TR + MSCI G. Dragon (20171001)'
+    非 Benchmark 行原样返回。
+    """
+    if not entity_name.startswith("Benchmark"):
+        return entity_name
+    m = re.match(r'^Benchmark\s*\d*\s*:\s*', entity_name)
+    if m:
+        return entity_name[m.end():].strip()
+    return entity_name
+
+
+def _detect_entity_type(raw_entity_name: str) -> str:
+    """根据原始 entity_name 判断实体类型。
+    返回值：'fund' | 'benchmark' | 'peer_avg' | 'peer_count'
+    """
+    if raw_entity_name == "Peer Group Average":
+        return "peer_avg"
+    if raw_entity_name == "Peer Group Count":
+        return "peer_count"
+    if raw_entity_name.startswith("Benchmark"):
+        return "benchmark"
+    return "fund"
+
+
+def _extract_fund_codes_from_group(group_name: str) -> List[str]:
+    """
+    从 peer group 名称中提取 fund_code 列表。
+    例：
+      'Grt Chn Eq_HKSFC (VPAF & CG)' → ['VPAF', 'CG']
+      'Asia ex Japan Eq_HKSFC (VPHY)'  → ['VPHY']
+      'China Equity_HKSFC (VPCA & VPMF)' → ['VPCA', 'VPMF']
+    """
+    match = re.search(r'\(([^)]+)\)', group_name)
+    if not match:
+        return []
+    content = match.group(1)
+    return [c.strip() for c in re.split(r'[&,]', content) if c.strip()]
+
+
+def _upsert_fund_code_map(
+    db: Session,
+    report_id: int,
+    report_type: str,
+    inception_date_map: Optional[Dict[str, str]] = None,
+) -> int:
+    """
+    上传 Quartile_weekly 后，从 lc_report_qw_entity 自动推导
+    fund_code -> entity_name -> ISIN 映射并写入 lc_fund_code_map。
+
+    逻辑：
+      1. 取当次 report_id 下所有 entity 行（有 ISIN），按 strategy_group + source_row_number 排序
+      2. 对每个 strategy_group，提取括号内的 fund_code 列表
+      3. 按照 fund_code 顺序 = 实体行顺序 进行一一映射
+      4. inception_date 可选中，如提供 inception_date_map 则写入
+      5. UPSERT 到 lc_fund_code_map（只要 fund_code 不为空）
+      6. 自动查找同 peer group 内无 ISIN 的 BM 实体，填充 bm_entity_name
+    """
+    inception_date_map = inception_date_map or {}
+
+    table_prefix = "qw" if report_type == "Quartile_weekly" else "fa"
+    # 查询有 ISIN 的基金实体（fund 行）
+    rows = db.execute(
+        text(f"""
+            SELECT entity_name, isin, strategy_group, source_row_number
+            FROM lc_report_{table_prefix}_entity
+            WHERE report_id = :rid AND isin IS NOT NULL AND isin != ''
+            ORDER BY strategy_group, source_row_number
+        """),
+        {"rid": report_id},
+    ).fetchall()
+
+    # 按 strategy_group 分组 fund 实体
+    groups: Dict[str, List] = defaultdict(list)
+    for entity_name, isin, strategy_group, row_num in rows:
+        if strategy_group:
+            groups[strategy_group].append((entity_name, isin))
+
+    # 查询无 ISIN 的 benchmark 实体（排除 Peer Group 汇总行）
+    bm_rows = db.execute(
+        text(f"""
+            SELECT entity_name, strategy_group
+            FROM lc_report_{table_prefix}_entity
+            WHERE report_id = :rid
+              AND (isin IS NULL OR isin = '')
+              AND entity_name NOT LIKE 'Peer Group%%'
+              AND entity_name NOT LIKE 'Benchmark%%'
+            ORDER BY strategy_group, source_row_number
+        """),
+        {"rid": report_id},
+    ).fetchall()
+
+    # 按 strategy_group 分组 BM 实体
+    bm_by_group: Dict[str, List[str]] = defaultdict(list)
+    for bm_name, sg in bm_rows:
+        if sg:
+            bm_by_group[sg].append(bm_name)
+
+    upserted = 0
+    for group_name, entities in groups.items():
+        fund_codes = _extract_fund_codes_from_group(group_name)
+        if not fund_codes:
+            continue
+        # 取同 peer group 内的第一个 BM 实体名称
+        bm_list = bm_by_group.get(group_name, [])
+        bm_entity_name = bm_list[0] if bm_list else None
+
+        for i, fund_code in enumerate(fund_codes):
+            if i >= len(entities):
+                break
+            entity_name, isin = entities[i]
+            inc_date = inception_date_map.get(fund_code)  # None if not found
+            # Note: benchmark_name 字段由手工配置（对应 Excel Performance Sheet D列），
+            # ETL 上传时不覆盖该字段，仅更新 entity_name/isin/inception_date/bm_entity_name (有则跳过)
+            db.execute(
+                text("""
+                    INSERT INTO lc_fund_code_map (fund_code, entity_name, isin, inception_date, bm_entity_name)
+                    VALUES (:fc, :en, :isin, :inc, :bmen)
+                    ON DUPLICATE KEY UPDATE
+                        entity_name    = COALESCE(NULLIF(entity_name, ''), VALUES(entity_name)),
+                        isin           = COALESCE(NULLIF(isin, ''), NULLIF(VALUES(isin), '')),
+                        inception_date = COALESCE(inception_date, VALUES(inception_date)),
+                        bm_entity_name = COALESCE(NULLIF(bm_entity_name, ''), VALUES(bm_entity_name)),
+                        updated_at     = NOW()
+                """),
+                {"fc": fund_code, "en": entity_name, "isin": isin or "",
+                 "inc": inc_date, "bmen": bm_entity_name},
+            )
+            upserted += 1
+            logger.debug(
+                f"[loader] fund_code_map: {fund_code} -> {entity_name} ({isin})"
+                f" inception={inc_date} bm_entity={bm_entity_name}"
+            )
+
+    if upserted:
+        db.commit()
+        logger.info(f"[loader] lc_fund_code_map upserted {upserted} rows from report_id={report_id}")
+    return upserted
+
+
+def _first_column_name(df: pd.DataFrame) -> str:
+    for column in df.columns:
+        if "group/investment" in str(column).lower():
+            return column
+    raise ValueError("[L2001] missing Group/Investment-like column in parsed DataFrame")
+
+
+def _find_column(row_data: dict, keyword: str) -> any:
+    """Find a column value by exact match or suffix match."""
+    for col, val in row_data.items():
+        if str(col).strip() == keyword or str(col).endswith(f"_{keyword}"):
+            return val
+    return None
+
+
 # ---------------------------------------------------------------------------
-# meta 表写入
+# 各表幂等写入（lc_report_qw_* 系列）
 # ---------------------------------------------------------------------------
 
-def _upsert_meta(db: Session, report_id: int, report_type: str, row: Dict[str, Any]) -> int:
+def _upsert_report_meta(
+    db: Session,
+    report_id: int,
+    report_type: str,
+    row: Dict[str, Any],
+) -> int:
     """
-    幂等写入 lc_report_fa_meta。
-    幂等键：(source_filename, sheet_name, calculated_on)
-    返回 meta_id（用于 performance 关联）。
+    写入 lc_report_qw_meta。
+    幂等键：(report_id, report_type, sheet_name)
     """
     existing = db.execute(
         text("""
-            SELECT meta_id FROM lc_report_fa_meta
-            WHERE report_id=:rid AND source_filename=:sf AND sheet_name=:sn AND calculated_on=:co
+            SELECT meta_id FROM lc_report_qw_meta
+            WHERE report_id=:rid AND report_type=:rt AND sheet_name=:sn
         """),
-        {"rid": report_id, "sf": row["source_filename"], "sn": row["sheet_name"], "co": row["calculated_on"]},
+        {"rid": report_id, "rt": report_type, "sn": row["sheet_name"]},
     ).fetchone()
 
     if existing:
         mid = existing[0]
         db.execute(
             text("""
-                UPDATE lc_report_fa_meta SET
-                    report_set=:rs, snapshot_type=:st, snapshot_date=:sd,
-                    calculated_date=:cd, calculated_time=:ct,
-                    exported_on=:eo, currency=:cur, grouped_by=:gb,
-                    investments_filter=:inv, etl_run_id=:eid, updated_at=NOW()
+                UPDATE lc_report_qw_meta SET
+                    report_set=:rs, source_filename=:sf, report_name=:rn,
+                    currency=:cur, grouped_by=:gb, calculated_on=:co,
+                    exported_on=:eo, etl_run_id=:eid, updated_at=NOW()
                 WHERE meta_id=:mid
             """),
             {
-                "rs":  row["report_set"],   "st": row["snapshot_type"],
-                "sd":  row["snapshot_date"],"cd": row["calculated_date"],
-                "ct":  row["calculated_time"], "eo": _v(row.get("exported_on")),
-                "cur": row.get("currency", "US Dollar"),
-                "gb":  _v(row.get("grouped_by")),
-                "inv": _v(row.get("investments_filter")),
+                "rs": row["report_set"], "sf": row["source_filename"],
+                "rn": row.get("report_name"), "cur": row.get("currency"),
+                "gb": row.get("grouped_by"),
+                "co": _to_text(row.get("calculated_on")),
+                "eo": _to_text(row.get("exported_on")),
                 "eid": row.get("etl_run_id"), "mid": mid,
             },
         )
         return mid
-
-    mid = gen_id()
-    db.execute(
-        text("""
-            INSERT INTO lc_report_fa_meta (
-                meta_id, report_id, report_type, report_set, source_filename, sheet_name,
-                snapshot_type, snapshot_date, calculated_on, calculated_date, calculated_time,
-                exported_on, currency, grouped_by, investments_filter, etl_run_id
-            ) VALUES (
-                :mid, :rid, :rt, :rs, :sf, :sn,
-                :st, :sd, :co, :cd, :ct,
-                :eo, :cur, :gb, :inv, :eid
-            )
-        """),
-        {
-            "mid": mid, "rid": report_id, "rt": report_type,
-            "rs":  row["report_set"],    "sf": row["source_filename"],
-            "sn":  row["sheet_name"],    "st": row["snapshot_type"],
-            "sd":  row["snapshot_date"], "co": row["calculated_on"],
-            "cd":  row["calculated_date"],"ct": row["calculated_time"],
-            "eo":  _v(row.get("exported_on")),
-            "cur": row.get("currency", "US Dollar"),
-            "gb":  _v(row.get("grouped_by")),
-            "inv": _v(row.get("investments_filter")),
-            "eid": row.get("etl_run_id"),
-        },
-    )
-    return mid
+    else:
+        mid = gen_id()
+        db.execute(
+            text("""
+                INSERT INTO lc_report_qw_meta
+                    (meta_id, report_id, report_type, report_set, source_filename, sheet_name,
+                     report_name, currency, grouped_by, calculated_on, exported_on, etl_run_id)
+                VALUES
+                    (:mid, :rid, :rt, :rs, :sf, :sn, :rn, :cur, :gb, :co, :eo, :eid)
+            """),
+            {
+                "mid": mid, "rid": report_id, "rt": report_type,
+                "rs": row["report_set"], "sf": row["source_filename"],
+                "sn": row["sheet_name"], "rn": row.get("report_name"),
+                "cur": row.get("currency"), "gb": row.get("grouped_by"),
+                "co": _to_text(row.get("calculated_on")),
+                "eo": _to_text(row.get("exported_on")),
+                "eid": row.get("etl_run_id"),
+            },
+        )
+        return mid
 
 
-# ---------------------------------------------------------------------------
-# performance 表写入
-# ---------------------------------------------------------------------------
-
-def _upsert_perf(
+def _upsert_entity(
     db: Session,
-    meta_id: int,
     report_id: int,
     report_type: str,
-    row: Dict[str, Any],
-) -> None:
+    payload: Dict[str, Any],
+) -> int:
     """
-    幂等写入 lc_report_fa_performance。
-    幂等键：(meta_id, entity_name, isin, metric, period_type, start_date, end_date)
-    注意：isin 为 NULL 时统一转空字符串参与唯一键比较。
+    写入 lc_report_qw_entity。
+    幂等键：(report_id, report_type, sheet_name, entity_name, isin)
     """
-    entity_name = str(row["entity_name"])
-    isin        = str(row.get("isin") or "")
-    metric      = str(row["metric"])
-    period_type = str(row["period_type"])
-    start_date  = str(row["start_date"])
-    end_date    = str(row["end_date"])
-
+    isin = _to_text(payload.get("isin"))
     existing = db.execute(
         text("""
-            SELECT perf_id FROM lc_report_fa_performance
-            WHERE report_id=:rid AND meta_id=:mid AND entity_name=:en AND isin=:isin
-              AND metric=:m AND period_type=:pt AND start_date=:sd AND end_date=:ed
+            SELECT entity_id FROM lc_report_qw_entity
+            WHERE report_id=:rid AND report_type=:rt
+              AND sheet_name=:sn AND entity_name=:en
+              AND (strategy_group=:sg OR (strategy_group IS NULL AND :sg IS NULL))
         """),
-        {
-            "rid": report_id, "mid": meta_id, "en": entity_name, "isin": isin,
-            "m": metric, "pt": period_type, "sd": start_date, "ed": end_date,
-        },
+        {"rid": report_id, "rt": report_type,
+         "sn": payload["sheet_name"], "en": payload["entity_name"],
+         "sg": payload.get("strategy_group")},
     ).fetchone()
 
     if existing:
+        eid = existing[0]
         db.execute(
             text("""
-                UPDATE lc_report_fa_performance SET
-                    morningstar_rating=:mr, fund_size_date=:fsd, fund_size=:fs,
-                    value=:val, peer_group_rank=:pgr, peer_group_quartile=:pgq,
-                    source_row_number=:srn, source_column_name=:scn, updated_at=NOW()
-                WHERE perf_id=:pid
+                UPDATE lc_report_qw_entity SET
+                    entity_type=:et, isin=:isin,
+                    strategy_group=:sg, morningstar_rating=:mr, morningstar_category=:mc,
+                    benchmark=:bm, currency=:cur, source_row_number=:srn,
+                    etl_run_id=:etl, updated_at=NOW()
+                WHERE entity_id=:eid
             """),
             {
-                "mr":  _v(row.get("morningstar_rating")),
-                "fsd": _v(row.get("fund_size_date")),
-                "fs":  _to_float(row.get("fund_size")),
-                "val": _to_float(row.get("value")),
-                "pgr": _to_int(row.get("peer_group_rank")),
-                "pgq": _to_int(row.get("peer_group_quartile")),
-                "srn": _to_int(row.get("source_row_number")),
-                "scn": _v(row.get("source_column_name")),
-                "pid": existing[0],
+                "et": payload.get("entity_type", "fund"), "isin": isin,
+                "sg": payload.get("strategy_group"), "mr": payload.get("morningstar_rating"),
+                "mc": payload.get("morningstar_category"), "bm": payload.get("benchmark"),
+                "cur": payload.get("currency"), "srn": payload.get("source_row_number"),
+                "etl": payload.get("etl_run_id"), "eid": eid,
             },
         )
+        return eid
     else:
+        eid = gen_id()
         db.execute(
             text("""
-                INSERT INTO lc_report_fa_performance (
-                    perf_id, meta_id, report_id, report_type,
-                    entity_name, isin, morningstar_rating, fund_size_date, fund_size,
-                    period_type, metric, value, peer_group_rank, peer_group_quartile,
-                    start_date, end_date, source_row_number, source_column_name
-                ) VALUES (
-                    :pid, :mid, :rid, :rt,
-                    :en, :isin, :mr, :fsd, :fs,
-                    :pt, :m, :val, :pgr, :pgq,
-                    :sd, :ed, :srn, :scn
-                )
+                INSERT INTO lc_report_qw_entity
+                    (entity_id, report_id, report_type, report_set, sheet_name, entity_name,
+                     entity_type, isin, strategy_group, morningstar_rating, morningstar_category,
+                     benchmark, currency, source_row_number, etl_run_id)
+                VALUES
+                    (:eid, :rid, :rt, :rs, :sn, :en, :et, :isin, :sg, :mr, :mc, :bm, :cur, :srn, :etl)
             """),
             {
-                "pid": gen_id(), "mid": meta_id, "rid": report_id, "rt": report_type,
-                "en":  entity_name, "isin": isin,
-                "mr":  _v(row.get("morningstar_rating")),
-                "fsd": _v(row.get("fund_size_date")),
-                "fs":  _to_float(row.get("fund_size")),
-                "pt":  period_type, "m": metric,
-                "val": _to_float(row.get("value")),
-                "pgr": _to_int(row.get("peer_group_rank")),
-                "pgq": _to_int(row.get("peer_group_quartile")),
-                "sd":  start_date, "ed": end_date,
-                "srn": _to_int(row.get("source_row_number")),
-                "scn": _v(row.get("source_column_name")),
+                "eid": eid, "rid": report_id, "rt": report_type,
+                "rs": payload["report_set"], "sn": payload["sheet_name"],
+                "en": payload["entity_name"], "et": payload.get("entity_type", "fund"),
+                "isin": isin,
+                "sg": payload.get("strategy_group"), "mr": payload.get("morningstar_rating"),
+                "mc": payload.get("morningstar_category"), "bm": payload.get("benchmark"),
+                "cur": payload.get("currency"), "srn": payload.get("source_row_number"),
+                "etl": payload.get("etl_run_id"),
             },
         )
+        return eid
+
+
+def _upsert_size_snapshots(
+    db: Session,
+    entity_id: int,
+    report_id: int,
+    report_type: str,
+    row_data: Dict[str, Any],
+    mapped_columns: Dict[str, Any],
+) -> None:
+    """写入 lc_report_qw_size_snapshot。幂等键：(entity_id, size_type, snapshot_date)"""
+    for column_name, mapping in mapped_columns.items():
+        if mapping.value_role != "size_value":
+            continue
+        snapshot_value = _to_text(row_data.get(column_name)).strip()
+        if not snapshot_value:
+            continue
+
+        st = mapping.size_type or "daily"
+        sd = mapping.end_date or row_data.get("calculated_on", "")
+
+        existing = db.execute(
+            text("""
+                SELECT snapshot_id FROM lc_report_qw_size_snapshot
+                WHERE entity_id=:eid AND size_type=:st AND snapshot_date=:sd
+            """),
+            {"eid": entity_id, "st": st, "sd": sd},
+        ).fetchone()
+
+        if existing:
+            db.execute(
+                text("""
+                    UPDATE lc_report_qw_size_snapshot SET
+                        snapshot_value=:sv, source_column_name=:scn, source_col_number=:scol, updated_at=NOW()
+                    WHERE snapshot_id=:sid
+                """),
+                {"sv": snapshot_value, "scn": column_name, "scol": row_data.get("col_indices", {}).get(column_name, 0), "sid": existing[0]},
+            )
+        else:
+            db.execute(
+                text("""
+                    INSERT INTO lc_report_qw_size_snapshot
+                        (snapshot_id, entity_id, report_id, report_type,
+                         size_type, snapshot_date, snapshot_value, source_column_name, source_col_number)
+                    VALUES (:sid, :eid, :rid, :rt, :st, :sd, :sv, :scn, :scol)
+                """),
+                {
+                    "sid": gen_id(), "eid": entity_id,
+                    "rid": report_id, "rt": report_type,
+                    "st": st, "sd": sd,
+                    "sv": snapshot_value, "scn": column_name,
+                    "scol": row_data.get("col_indices", {}).get(column_name, 0),
+                },
+            )
+
+
+def _upsert_performance(
+    db: Session,
+    meta_id: int,
+    entity_id: int,
+    report_id: int,
+    report_type: str,
+    row_data: Dict[str, Any],
+    mapped_columns: Dict[str, Any],
+) -> int:
+    """
+    写入 lc_report_qw_performance。
+    幂等键：(entity_id, period_type, period_label, start_date, end_date, metric)
+    """
+    grouped: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
+    for column_name, mapping in mapped_columns.items():
+        if mapping.period_type is None:
+            continue
+        if mapping.value_role not in {"value", "peer_group_rank", "peer_group_quartile"}:
+            continue
+        pt = mapping.period_type
+        grouped[pt].setdefault("period_label", mapping.period_label)
+        grouped[pt].setdefault("start_date", mapping.start_date)
+        grouped[pt].setdefault("end_date", mapping.end_date)
+        grouped[pt].setdefault("metrics", {})
+        grouped[pt].setdefault("peer_group_rank", None)
+        grouped[pt].setdefault("peer_group_quartile", None)
+
+        if mapping.value_role == "value":
+            grouped[pt]["metrics"][mapping.metric_kind] = (
+                _to_float(row_data.get(column_name)), column_name, row_data.get("col_indices", {}).get(column_name, 0)
+            )
+        elif mapping.value_role == "peer_group_rank":
+            grouped[pt]["peer_group_rank"] = _to_float(row_data.get(column_name))
+        elif mapping.value_role == "peer_group_quartile":
+            grouped[pt]["peer_group_quartile"] = _to_float(row_data.get(column_name))
+
+    changed = 0
+    for period_type, payload in grouped.items():
+        for metric, metric_info in payload["metrics"].items():
+            if metric is None:
+                continue
+            metric_value, source_column_name, source_col_number = metric_info
+            if metric_value is None:
+                continue
+
+            period_label = payload["period_label"] or ""
+            start_date   = payload["start_date"] or ""
+            end_date     = payload["end_date"] or ""
+
+            existing = db.execute(
+                text("""
+                    SELECT perf_id FROM lc_report_qw_performance
+                    WHERE entity_id=:eid AND period_type=:pt AND period_label=:pl
+                      AND start_date=:sd AND end_date=:ed AND metric=:m
+                """),
+                {"eid": entity_id, "pt": period_type, "pl": period_label,
+                 "sd": start_date, "ed": end_date, "m": metric},
+            ).fetchone()
+
+            if existing:
+                db.execute(
+                    text("""
+                        UPDATE lc_report_qw_performance SET
+                            value=:val, peer_group_rank=:pgr, peer_group_quartile=:pgq,
+                            source_row_number=:srn, source_column_name=:scn, source_col_number=:scol, updated_at=NOW()
+                        WHERE perf_id=:pid
+                    """),
+                    {
+                        "val": metric_value,
+                        "pgr": payload["peer_group_rank"],
+                        "pgq": payload["peer_group_quartile"],
+                        "srn": int(row_data["row_number"]),
+                        "scn": source_column_name,
+                        "scol": source_col_number,
+                        "pid": existing[0],
+                    },
+                )
+            else:
+                db.execute(
+                    text("""
+                        INSERT INTO lc_report_qw_performance
+                            (perf_id, meta_id, entity_id, report_id, report_type,
+                             report_set, sheet_name, period_type, period_label,
+                             start_date, end_date, metric, value,
+                             peer_group_rank, peer_group_quartile,
+                             source_row_number, source_column_name, source_col_number)
+                        VALUES
+                            (:pid, :mid, :eid, :rid, :rt,
+                             :rs, :sn, :pt, :pl,
+                             :sd, :ed, :m, :val,
+                             :pgr, :pgq, :srn, :scn, :scol)
+                    """),
+                    {
+                        "pid": gen_id(), "mid": meta_id, "eid": entity_id,
+                        "rid": report_id, "rt": report_type,
+                        "rs": row_data["report_set"], "sn": row_data["row_source_sheet"],
+                        "pt": period_type, "pl": period_label,
+                        "sd": start_date, "ed": end_date, "m": metric,
+                        "val": metric_value,
+                        "pgr": payload["peer_group_rank"],
+                        "pgq": payload["peer_group_quartile"],
+                        "srn": int(row_data["row_number"]),
+                        "scn": source_column_name,
+                        "scol": source_col_number,
+                    },
+                )
+            changed += 1
+
+    return changed
 
 
 # ---------------------------------------------------------------------------
-# 主入口
+# 主入口（批量版 — 消除 N+1 查询，单事务保证原子性）
 # ---------------------------------------------------------------------------
 
 def load_fa_to_mysql(
     db: Session,
-    meta_df: pd.DataFrame,
-    perf_df: pd.DataFrame,
+    parsed_df: pd.DataFrame,
+    meta_records: List[Dict[str, Any]],
     report_id: int,
-    report_type: str,
-    fund_map_df: pd.DataFrame | None = None,
+    column_lineage_by_sheet: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, int]:
     """
-    幂等写入 lc_report_fa_meta 和 lc_report_fa_performance。
-    若提供 fund_map_df，同时 UPSERT lc_fund_code_map（fund_code → entity_name 映射）。
+    阶段二主入口：将 pipeline 输出的 DataFrame 幂等批量写入 MySQL。
+
+    优化：
+      - 所有 DELETE + INSERT 在同一个事务内执行
+      - 用 Python 侧收集数据 → executemany 批量写入，消除 N+1 SELECT 查询
+      - 若任意步骤失败，rollback 自动还原旧数据
+
+    Args:
+        db:                 SQLAlchemy Session
+        parsed_df:          run_pipeline 返回的 parsed_df
+        meta_records:       run_pipeline 返回的 meta_records
+        report_id:          对应的 lc_report.report_id
 
     Returns:
-        {
-            "fa_meta_rows": int,
-            "fa_perf_rows_changed": int,
-            "fa_perf_input_rows": int,
-            "fund_map_rows": int,
-        }
+        统计字典 {report_meta_rows, entity_rows_processed, performance_rows_changed, fund_map_rows}
     """
-    if meta_df.empty:
-        logger.warning("[fa_loader] meta_df is empty, nothing to load.")
-        return {"fa_meta_rows": 0, "fa_perf_rows_changed": 0, "fa_perf_input_rows": 0}
+    import time
+    t0 = time.perf_counter()
 
-    # 开启事务：先清理该报告的旧数据，防止重复上传时有脏数据残留
-    db.execute(text("DELETE FROM lc_report_fa_performance WHERE report_id=:rid"), {"rid": report_id})
-    db.execute(text("DELETE FROM lc_report_fa_meta WHERE report_id=:rid"), {"rid": report_id})
+    if parsed_df.empty:
+        logger.warning("[loader] parsed_df is empty, nothing to load.")
+        raise ValueError("解析结果为空，没有提取到任何有效数据，请检查文件格式或目标 Sheet 是否正确。")
 
-    # 1. 写入元数据，建立 (source_filename, sheet_name, calculated_on) → meta_id 映射
-    meta_lookup: Dict[tuple, int] = {}
-    for record in meta_df.to_dict("records"):
-        mid = _upsert_meta(db, report_id, report_type, record)
-        meta_lookup[(record["source_filename"], record["sheet_name"], record["calculated_on"])] = mid
+    first_col = _first_column_name(parsed_df)
+    mapped_columns = {c: map_column(c) for c in parsed_df.columns}
 
-    # 2. 写入表现明细
-    perf_changed = 0
-    for row in perf_df.to_dict("records"):
-        key = (row["source_filename"], row["sheet_name"], row["calculated_on"])
-        meta_id = meta_lookup.get(key)
-        if meta_id is None:
-            logger.warning(f"[fa_loader] no meta_id for key={key}, skipping row.")
+    # fallback to global col_indices if column_lineage_by_sheet is not provided
+    global_col_indices = {c: idx + 1 for idx, c in enumerate(parsed_df.columns)}
+
+    sheet_currency: Dict[str, str] = {
+        r["sheet_name"]: r.get("currency", "") for r in meta_records
+    }
+    sheet_calculated_on: Dict[str, str] = {
+        r["sheet_name"]: _to_text(r.get("calculated_on")) for r in meta_records
+    }
+
+    # ------------------------------------------------------------------
+    # 第一步：在 Python 侧收集全部待写入数据（不发任何 SELECT）
+    # ------------------------------------------------------------------
+    meta_key_to_id: Dict[tuple, int] = {}
+    meta_batch: List[Dict] = []
+    for record in meta_records:
+        mid = gen_id()
+        meta_key_to_id[(record["report_set"], record["sheet_name"])] = mid
+        meta_batch.append({
+            "mid": mid, "rid": report_id, "rt": "FundAnalysis",
+            "rs": record["report_set"], "sf": record["source_filename"],
+            "sn": record["sheet_name"], "rn": record.get("report_name"),
+            "cur": record.get("currency"), "gb": record.get("grouped_by"),
+            "co": _to_text(record.get("calculated_on")),
+            "eo": _to_text(record.get("exported_on")),
+            "eid_": record.get("etl_run_id"),
+        })
+
+    entity_batch: List[Dict] = []
+    size_batch:   List[Dict] = []
+    perf_batch:   List[Dict] = []
+
+    for row_data in parsed_df.to_dict("records"):
+        if not _is_data_row(row_data.get(first_col)):
             continue
-        _upsert_perf(db, meta_id, report_id, report_type, row)
-        perf_changed += 1
 
-    db.commit()
+        sheet_name = row_data["row_source_sheet"]
+        key = (row_data["report_set"], sheet_name)
+        
+        # Get sheet specific column indices
+        col_indices = global_col_indices
+        if column_lineage_by_sheet and sheet_name in column_lineage_by_sheet:
+            from openpyxl.utils.cell import column_index_from_string
+            lineage = column_lineage_by_sheet[sheet_name]
+            col_indices = {}
+            for col_name, info in lineage.items():
+                if "column_letter" in info:
+                    col_indices[col_name] = column_index_from_string(info["column_letter"])
+                    
+
+        meta_id = meta_key_to_id.get(key)
+        if meta_id is None:
+            logger.warning(f"[loader] meta_id not found for key={key}, skipping row.")
+            continue
+
+        raw_entity_name = str(row_data.get(first_col, "")).strip()
+        entity_type = _detect_entity_type(raw_entity_name)
+        group_cat = str(row_data.get("group_category", "")).strip()
+        if entity_type == "fund" and group_cat == "BM":
+            entity_type = "benchmark"
+        is_benchmark = (entity_type == "benchmark")
+        entity_name  = _normalize_bm_entity_name(raw_entity_name) if is_benchmark else raw_entity_name
+        
+        raw_isin = _find_column(row_data, "ISIN")
+        entity_isin  = "" if entity_type != "fund" else _to_text(raw_isin)
+
+        mr = _find_column(row_data, "Morningstar Rating Overall")
+        mc = _find_column(row_data, "Morningstar Category")
+        bm = _find_column(row_data, "Calculation Benchmark")
+        
+        base_currency = _to_text(_find_column(row_data, "Base Currency"))
+        if not base_currency:
+            base_currency = sheet_currency.get(row_data["row_source_sheet"], "")
+
+        eid = gen_id()
+        entity_batch.append({
+            "eid": eid, "rid": report_id, "rt": "FundAnalysis",
+            "rs": row_data["report_set"], "sn": row_data["row_source_sheet"],
+            "en": entity_name, "et": entity_type, "isin": entity_isin,
+            "sg": row_data.get("group_category"),
+            "mr": mr, "mc": mc, "bm": bm,
+            "cur": base_currency,
+            "srn": int(row_data.get("row_number", 0)),
+            "etl": row_data.get("etl_run_id"),
+        })
+
+        # 收集 size snapshot
+        for column_name, mapping in mapped_columns.items():
+            if mapping.value_role != "size_value":
+                continue
+            snapshot_value = _to_text(row_data.get(column_name)).strip()
+            if not snapshot_value:
+                continue
+                
+            st = mapping.size_type or "daily"
+            sd = mapping.end_date or sheet_calculated_on.get(row_data["row_source_sheet"], "")
+
+            size_batch.append({
+                "sid": gen_id(), "eid": eid, "rid": report_id, "rt": "FundAnalysis",
+                "st": st, "sd": sd,
+                "sv": snapshot_value, "scn": column_name,
+                "scol": col_indices.get(column_name, 0),
+            })
+
+        # 收集 performance（按 period_type 聚合，与原逻辑一致）
+        grouped: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        
+        sheet_name = row_data.get("row_source_sheet", "")
+        valid_columns = None
+        if column_lineage_by_sheet and sheet_name in column_lineage_by_sheet:
+            valid_columns = set(column_lineage_by_sheet[sheet_name].keys())
+
+        for column_name, mapping in mapped_columns.items():
+            if valid_columns is not None and column_name not in valid_columns:
+                continue
+                
+            if mapping.period_type is None:
+                continue
+            if mapping.value_role not in {"value", "peer_group_rank", "peer_group_quartile"}:
+                continue
+            pt = mapping.period_type
+            grouped[pt].setdefault("period_label",   mapping.period_label)
+            grouped[pt].setdefault("start_date",     mapping.start_date)
+            grouped[pt].setdefault("end_date",       mapping.end_date)
+            grouped[pt].setdefault("metrics",        {})
+            grouped[pt].setdefault("peer_group_rank",    None)
+            grouped[pt].setdefault("peer_group_quartile", None)
+
+            val = _to_float(row_data.get(column_name))
+            if mapping.value_role == "value":
+                grouped[pt]["metrics"][mapping.metric_kind] = (val, column_name, col_indices.get(column_name, 0))
+            elif mapping.value_role == "peer_group_rank":
+                grouped[pt]["peer_group_rank"] = val
+            elif mapping.value_role == "peer_group_quartile":
+                grouped[pt]["peer_group_quartile"] = val
+
+        for period_type, payload in grouped.items():
+            for metric, metric_info in payload["metrics"].items():
+                if metric is None:
+                    continue
+                metric_value, source_column_name, source_col_number = metric_info
+                if metric_value is None:
+                    continue
+                perf_batch.append({
+                    "pid": gen_id(), "mid": meta_id, "eid": eid,
+                    "rid": report_id, "rt": "FundAnalysis",
+                    "rs": row_data["report_set"], "sn": row_data["row_source_sheet"],
+                    "pt": period_type, "pl": payload["period_label"] or "",
+                    "sd": payload["start_date"] or "", "ed": payload["end_date"] or "",
+                    "m": metric, "val": metric_value,
+                    "pgr": payload["peer_group_rank"],
+                    "pgq": payload["peer_group_quartile"],
+                    "srn": int(row_data["row_number"]),
+                    "scn": source_column_name,
+                    "scol": source_col_number,
+                })
+
+    t1 = time.perf_counter()
     logger.info(
-        f"[fa_loader] report_id={report_id} done: "
-        f"meta={len(meta_df)}, perf_changed={perf_changed}"
+        f"[loader] data collection done in {t1-t0:.2f}s: "
+        f"meta={len(meta_batch)}, entity={len(entity_batch)}, "
+        f"size={len(size_batch)}, perf={len(perf_batch)}"
     )
 
-    # 写入 fund_code 映射表（如果提供）
-    fund_map_rows = 0
-    # 用户要求：解析入库时，不要再自动插入更新 lc_fund_code_map 表，改为手动维护
-    # if fund_map_df is not None and not fund_map_df.empty:
-    #     for rec in fund_map_df.to_dict("records"):
-    #         db.execute(
-    #             text("""
-    #                 INSERT INTO lc_fund_code_map (fund_code, entity_name, isin)
-    #                 VALUES (:fc, :en, :isin)
-    #                 ON DUPLICATE KEY UPDATE
-    #                     entity_name = VALUES(entity_name),
-    #                     isin        = VALUES(isin),
-    #                     updated_at  = NOW()
-    #             """),
-    #             {
-    #                 "fc":   str(rec["fund_code"]),
-    #                 "en":   str(rec["entity_name"]),
-    #                 "isin": str(rec.get("isin") or ""),
-    #             },
-    #         )
-    #         fund_map_rows += 1
-    #     db.commit()
-    #     logger.info(f"[fa_loader] lc_fund_code_map upserted: {fund_map_rows} rows")
+    table_prefix = "fa"
+
+    # ------------------------------------------------------------------
+    # 第二步：单事务写入 — DELETE + batch INSERT（全部原子执行）
+    #   若任意步骤抛异常 → rollback → 旧数据自动还原
+    # ------------------------------------------------------------------
+    try:
+        # 清理旧数据（此时尚未 commit，失败可 rollback）
+        db.execute(text(f"DELETE FROM lc_report_{table_prefix}_performance  WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text(f"DELETE FROM lc_report_{table_prefix}_size_snapshot WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text(f"DELETE FROM lc_report_{table_prefix}_entity        WHERE report_id=:rid"), {"rid": report_id})
+        db.execute(text(f"DELETE FROM lc_report_{table_prefix}_meta          WHERE report_id=:rid"), {"rid": report_id})
+
+        # 批量写入 meta
+        if meta_batch:
+            db.execute(text(f"""
+                INSERT INTO lc_report_{table_prefix}_meta
+                    (meta_id, report_id, report_type, report_set, source_filename, sheet_name,
+                     report_name, currency, grouped_by, calculated_on, exported_on, etl_run_id)
+                VALUES (:mid, :rid, :rt, :rs, :sf, :sn, :rn, :cur, :gb, :co, :eo, :eid_)
+            """), meta_batch)
+
+        # 批量写入 entity
+        if entity_batch:
+            db.execute(text(f"""
+                INSERT INTO lc_report_{table_prefix}_entity
+                    (entity_id, report_id, report_type, report_set, sheet_name, entity_name,
+                     entity_type, isin, strategy_group, morningstar_rating, morningstar_category,
+                     benchmark, currency, source_row_number, etl_run_id)
+                VALUES (:eid, :rid, :rt, :rs, :sn, :en, :et, :isin, :sg, :mr, :mc, :bm, :cur, :srn, :etl)
+            """), entity_batch)
+
+        # 批量写入 size_snapshot
+        if size_batch:
+            db.execute(text(f"""
+                INSERT INTO lc_report_{table_prefix}_size_snapshot
+                    (snapshot_id, entity_id, report_id, report_type,
+                     size_type, snapshot_date, snapshot_value, source_column_name, source_col_number)
+                VALUES (:sid, :eid, :rid, :rt, :st, :sd, :sv, :scn, :scol)
+            """), size_batch)
+
+        # 批量写入 performance
+        if perf_batch:
+            db.execute(text(f"""
+                INSERT INTO lc_report_{table_prefix}_performance
+                    (perf_id, meta_id, entity_id, report_id, report_type,
+                     report_set, sheet_name, period_type, period_label,
+                     start_date, end_date, metric, value,
+                     peer_group_rank, peer_group_quartile,
+                     source_row_number, source_column_name, source_col_number)
+                VALUES (:pid, :mid, :eid, :rid, :rt,
+                        :rs, :sn, :pt, :pl,
+                        :sd, :ed, :m, :val,
+                        :pgr, :pgq, :srn, :scn, :scol)
+            """), perf_batch)
+
+        db.commit()
+
+        t2 = time.perf_counter()
+        logger.info(
+            f"[loader] batch insert done in {t2-t1:.2f}s (total {t2-t0:.2f}s). "
+            f"report_id={report_id} type=FundAnalysis: "
+            f"entities={len(entity_batch)}, perf={len(perf_batch)}"
+        )
+
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            f"[loader] load_to_mysql FAILED for report_id={report_id}, "
+            f"rolled back. Error: {exc}"
+        )
+        raise
 
     return {
-        "fa_meta_rows":        len(meta_df),
-        "fa_perf_rows_changed": perf_changed,
-        "fa_perf_input_rows":  int(len(perf_df)),
-        "fund_map_rows":       fund_map_rows,
+        "report_meta_rows":         len(meta_batch),
+        "entity_rows_processed":    len(entity_batch),
+        "performance_rows_changed": len(perf_batch),
+        "fund_map_rows":            0,
     }
+
+

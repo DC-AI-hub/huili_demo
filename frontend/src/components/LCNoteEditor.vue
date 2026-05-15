@@ -162,7 +162,7 @@ async function fetchFaData() {
     return
   }
   try {
-    const res  = await fetch(`${BASE}/files/${props.faFileId}/parsed-data`)
+    const res  = await fetch(`${BASE}/reports/${props.reportId}/fa-compare`)
     if (!res.ok) {
       faError.value = `加载 FA 数据失败（HTTP ${res.status}）`
       return
